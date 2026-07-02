@@ -35,7 +35,13 @@ from transformers import EsmForProteinFolding, AutoTokenizer
 from transformers.models.esm.modeling_esmfold import EsmFoldingTrunk
 from transformers.utils import ContextManagers
 
+# NOTE: possible bug -- CollectedRepresentations/TrunkHooks are imported but never
+# used anywhere in this file; this module defines its own, more specialized
+# AttentionCollector/AttentionHooks classes below instead (likely a leftover import
+# from refactoring away from the shared representation_utils hooks).
 from src.utils.representation_utils import CollectedRepresentations, TrunkHooks
+# Shared helper: loads facebook/esmfold_v1 + tokenizer with auto-selected precision (see model_utils.py).
+from src.utils.model_utils import load_esmfold
 
 
 # ============================================================================
@@ -45,6 +51,10 @@ from src.utils.representation_utils import CollectedRepresentations, TrunkHooks
 @dataclass
 class AttentionCollector:
     """Container for collected attention data."""
+    # Each dict is keyed by trunk block_idx (int). Values are detached, CPU tensors:
+    #   bias: raw pair_to_sequence output, shape [1, L, L, num_heads]
+    #   attn_with_bias / attn_without_bias: softmax attention weights, shape [1, L, L, num_heads]
+    #   (with/without the pairwise bias term added to the raw attention logits)
     bias: Dict[int, torch.Tensor] = field(default_factory=dict)
     attn_with_bias: Dict[int, torch.Tensor] = field(default_factory=dict)
     attn_without_bias: Dict[int, torch.Tensor] = field(default_factory=dict)
@@ -71,6 +81,13 @@ class AttentionHooks:
         hooks.remove()
         # collector.bias, collector.attn_with_bias now populated
     """
+    # NOTE: possible bug -- this usage example doesn't match the actual method
+    # signatures below: __init__ takes no `blocks` kwarg (blocks are passed to
+    # register() instead), and register() only hooks pair_to_sequence to populate
+    # collector.bias -- it never calls _compute_attention, so collector.attn_with_bias
+    # is NOT actually populated by this class despite what the example implies.
+    # (The working implementation of that logic lives in the module-level
+    # run_and_collect_attention() function instead, which duplicates this same math.)
     
     def __init__(self, trunk: nn.Module, collector: AttentionCollector):
         self.trunk = trunk
@@ -88,19 +105,30 @@ class AttentionHooks:
         """Compute attention weights with and without bias."""
         module = seq_attention_module
         
+        # x: [B, L, d_model]. proj() is a single Linear producing concatenated q,k,v;
+        # view splits the last dim into (num_heads, 3*head_dim), then permute moves
+        # heads before the sequence dim -> [B, num_heads, L, 3*head_dim].
         t = module.proj(x).view(*x.shape[:2], module.num_heads, -1)
         t = t.permute(0, 2, 1, 3)
+        # Split the combined projection into q, k, v, each [B, num_heads, L, head_dim].
         q, k, v = t.chunk(3, dim=-1)
-        q = module.rescale_factor * q
+        q = module.rescale_factor * q  # standard 1/sqrt(head_dim)-style attention scaling
         
+        # Dot-product attention logits: [B, num_heads, L, L] (q positions x k positions).
         raw_scores = torch.einsum("...qc,...kc->...qk", q, k)
+        # bias arrives as [B, L, L, num_heads] (matching the pair_to_sequence output
+        # layout); permute to [B, num_heads, L, L] so it aligns with raw_scores.
         bias_permuted = bias.permute(0, 3, 1, 2)
         
         if mask is not None:
             mask_2d = mask[:, None, None, :]
+            # Masked-out key positions get -inf logits so softmax assigns them ~0 probability.
             raw_scores = raw_scores.masked_fill(mask_2d == False, -np.inf)
         
         attn_without_bias = F.softmax(raw_scores, dim=-1)
+        # This is the actual mechanism under study: adding the pair_to_sequence bias
+        # into the attention logits before the softmax, i.e. how the pairwise (z)
+        # representation influences per-residue sequence attention.
         scores_with_bias = raw_scores + bias_permuted
         attn_with_bias = F.softmax(scores_with_bias, dim=-1)
         
@@ -121,17 +149,25 @@ class AttentionHooks:
             block = self.trunk.blocks[block_idx]
             
             # Hook on pair_to_sequence to capture bias
+            # make_bias_hook is a closure factory so each hook captures its own b_idx
+            # by value; without it, all hooks would close over the same loop variable
+            # `block_idx` and end up recording every block's bias under the final index
+            # (the classic Python late-binding-closure pitfall).
             def make_bias_hook(b_idx):
                 def hook(module, inputs, outputs):
                     # outputs is the bias tensor
                     self.collector.bias[b_idx] = outputs.detach().cpu()
                 return hook
             
+            # register_forward_hook fires after pair_to_sequence's forward completes,
+            # receiving (module, inputs, outputs) -- here outputs *is* the bias tensor.
             handle = block.pair_to_sequence.register_forward_hook(make_bias_hook(block_idx))
             self.handles.append(handle)
     
     def remove(self):
         """Remove all registered hooks."""
+        # Must be called after the forward pass, or these hooks (and their captured
+        # closures) keep firing on every subsequent forward call on this trunk.
         for h in self.handles:
             h.remove()
         self.handles.clear()
@@ -151,21 +187,34 @@ def create_pairwise_mask(
     mode: str,
 ) -> torch.Tensor:
     """Create pairwise patch mask."""
+    # Boolean [target_len, target_len] mask: True marks (i, j) pairwise positions in
+    # the target's z tensor that should be overwritten with the donor's z values.
     mask = torch.zeros(target_len, target_len, dtype=torch.bool)
     
     if mode == "intra":
+        # Patch only the hairpin-internal square block: donor's intra-hairpin pairwise
+        # contacts overwrite the target's intra-hairpin pairwise contacts.
         mask[target_start:target_end, target_start:target_end] = True
     elif mode in ("touch", "hole"):
+        # Extend the patched footprint into the flanking context on both sides of the
+        # hairpin, but only as far as BOTH donor and target actually have context
+        # available (so indices stay valid on both sides) -- hence the min() with
+        # each sequence's available flank length.
         left_extent = min(donor_start, target_start)
         right_extent = min(donor_len - donor_end, target_len - target_end)
         
         transport_start = target_start - left_extent
         transport_end = target_end + right_extent
         
+        # Patch both the "row band" and "column band" through the hairpin region
+        # (z need not be exactly symmetric), covering the full cross-shaped footprint.
         mask[target_start:target_end, transport_start:transport_end] = True
         mask[transport_start:transport_end, target_start:target_end] = True
         
         if mode == "hole":
+            # "hole" removes the interior hairpin-hairpin block from the footprint,
+            # leaving only the surrounding context patched -- tests whether context
+            # alone (without patching the interior contacts) carries any signal.
             mask[target_start:target_end, target_start:target_end] = False
     
     return mask
@@ -197,9 +246,17 @@ def run_and_collect_attention(
     # Since attention computation requires the sequence representation,
     # we'll use a modified trunk forward
     
+    # Mutable dict captured by the closures below; nested functions can read AND
+    # mutate this dict's contents (attn_data['bias'][idx] = ...) without needing
+    # `nonlocal`, since we're mutating the dict in place rather than rebinding the
+    # name `attn_data` itself.
     attn_data = {'bias': {}, 'attn_with_bias': {}, 'attn_without_bias': {}}
     
     def make_attention_collecting_forward(blocks_to_collect):
+        # Replacement for EsmFoldingTrunk.forward: identical to the original trunk
+        # forward pass, except it intercepts each requested block's pair_to_sequence
+        # bias and the resulting attention (with/without that bias) as it goes,
+        # rather than needing a separate hook per quantity of interest.
         def forward(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
             device = seq_feats.device
             s_s_0, s_z_0 = seq_feats, pair_feats
@@ -207,6 +264,8 @@ def run_and_collect_attention(
             if no_recycles is None:
                 no_recycles = self.config.max_recycles
             else:
+                # Caller passes num_recycles=0 below; incrementing here means the
+                # main loop still runs exactly once (a single, non-recycled pass).
                 no_recycles += 1
 
             def compute_attention(seq_attention_module, x, bias, attn_mask=None):
@@ -233,7 +292,10 @@ def run_and_collect_attention(
                 
                 for block_idx, block in enumerate(self.blocks):
                     if block_idx in blocks_to_collect:
-                        bias = block.pair_to_sequence(z)
+                        # Compute (and stash) the bias fresh here rather than relying on
+                        # a forward hook, since we also need `s` (pre-block) to compute
+                        # the resulting attention in the same place.
+                        bias = block.pair_to_sequence(z)  # [1, L, L, num_heads]
                         attn_data['bias'][block_idx] = bias.detach().cpu()
                         
                         seq_normed = block.layernorm_1(s)
@@ -250,9 +312,16 @@ def run_and_collect_attention(
             s_s, s_z = s_s_0, s_z_0
             recycle_s = torch.zeros_like(s_s)
             recycle_z = torch.zeros_like(s_z)
+            # recycle_bins holds discretized CA-CA distance-bin indices fed back into
+            # the trunk on the next recycle; initialized to bin 0 (no prior structure).
             recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
 
+            # Standard ESMFold/AlphaFold-style recycling loop: repeatedly re-run the
+            # trunk, feeding the previous iteration's (normalized) s/z and predicted
+            # distance bins back in as extra context, refining the structure each time.
             for recycle_idx in range(no_recycles):
+                # Only the final recycle iteration needs gradients (irrelevant here
+                # since callers already wrap this in torch.no_grad() for inference).
                 with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
                     recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
                     recycle_z = self.recycle_z_norm(recycle_z.detach()).to(device)
@@ -266,6 +335,9 @@ def run_and_collect_attention(
                     )
 
                     recycle_s, recycle_z = s_s, s_z
+                    # Discretize predicted CA-CA distances (Å) into bins spanning
+                    # 3.375-21.375 Å (self.recycle_bins = number of bins) for use as
+                    # the next recycle's distance-embedding input.
                     recycle_bins = EsmFoldingTrunk.distogram(
                         structure["positions"][-1][:, :, :3],
                         3.375, 21.375, self.recycle_bins,
@@ -278,6 +350,8 @@ def run_and_collect_attention(
         return forward
     
     original_forward = model.trunk.forward
+    # types.MethodType binds the plain function as a bound method on this specific
+    # model.trunk instance only (not the class), so other model instances are unaffected.
     model.trunk.forward = types.MethodType(
         make_attention_collecting_forward(analysis_blocks), 
         model.trunk
@@ -286,15 +360,21 @@ def run_and_collect_attention(
     try:
         with torch.no_grad():
             inputs = tokenizer(sequence, return_tensors='pt', add_special_tokens=False).to(device)
+            # num_recycles=0 -> no_recycles becomes 1 inside the patched forward, i.e.
+            # a single un-recycled trunk pass (simpler/faster, and keeps "the bias at
+            # block X" unambiguous rather than varying across recycle iterations).
             outputs = model(**inputs, num_recycles=0)
     finally:
+        # Always restore the original forward, even if the forward pass above raised.
         model.trunk.forward = original_forward
     
     # Compute contact map from structure
     ca_positions = outputs.positions[-1, 0, :, 1, :]  # [L, 3] CA atoms
+    # outputs.positions: [n_recycles, batch, L, n_atoms, 3]; [-1] = final structure-module
+    # iteration, [0] = batch 0, atom index 1 = Cα (backbone atoms ordered N, CA, C, ...).
     diff = ca_positions.unsqueeze(0) - ca_positions.unsqueeze(1)
     distances = torch.sqrt((diff ** 2).sum(-1))
-    contact_map = (distances < 8.0).float()
+    contact_map = (distances < 8.0).float()  # 8 Å Cα-Cα cutoff: standard contact-map definition
     
     # Fill collector
     collector.bias = attn_data['bias']
@@ -321,6 +401,9 @@ def make_pairwise_patch_attention_forward(
     """
     Create trunk forward that patches pairwise and collects attention.
     """
+    # Same recycle-loop structure as run_and_collect_attention()'s patched forward
+    # above, but trunk_iter here additionally splices in the donor's z at patch_block
+    # before continuing (see apply_pairwise_patch below).
     def forward(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
         device = seq_feats.device
         s_s_0, s_z_0 = seq_feats, pair_feats
@@ -354,11 +437,20 @@ def make_pairwise_patch_attention_forward(
             donor = donor_z.to(z.device, dtype=z.dtype)
             mask_dev = pairwise_mask.to(z.device)
             
+            # For every masked (i, j) pair in the target's coordinate frame, translate
+            # it into the donor's coordinate frame (target and donor hairpins are
+            # assumed offset-aligned: same length, different start positions) and copy
+            # the donor's full per-pair feature vector into the target's z tensor.
+            # Not vectorized (plain Python loop over index pairs) -- simple/correct,
+            # fine given mask sizes here are small (a hairpin region plus flanks).
             indices = torch.where(mask_dev)
             for i in range(len(indices[0])):
                 ti, tj = indices[0][i].item(), indices[1][i].item()
                 di = ti - target_start + donor_start
                 dj = tj - target_start + donor_start
+                # Bounds check guards against the donor not having enough context on
+                # one side (create_pairwise_mask already tries to bound the footprint
+                # to what both sequences can support, so this is mostly a safety net).
                 if 0 <= di < donor.shape[1] and 0 <= dj < donor.shape[2]:
                     z[:, ti, tj, :] = donor[:, di, dj, :]
             return z
@@ -369,6 +461,9 @@ def make_pairwise_patch_attention_forward(
             for block_idx, block in enumerate(self.blocks):
                 # Apply patch at patch_block
                 if block_idx == patch_block:
+                    # NOTE: if no_recycles > 1, this patch is re-applied fresh at
+                    # patch_block on every recycle iteration (trunk_iter runs once per
+                    # recycle), each time overwriting whatever the target had there.
                     z = apply_pairwise_patch(z)
                 
                 # Collect attention at analysis blocks
@@ -442,8 +537,11 @@ def patch_pairwise_and_collect_attention(
     model.trunk.forward = types.MethodType(patched_forward, model.trunk)
     
     try:
+        # Caller's `with` block runs here (typically a single model(**inputs) call).
         yield
     finally:
+        # Guaranteed restore of the original trunk forward, even if the caller's code
+        # inside the `with` block raises.
         model.trunk.forward = original
 
 
@@ -457,9 +555,15 @@ def get_donor_z_at_block(
     """
     Run donor and capture pairwise representation at patch_block.
     """
+    # One-element list used as a mutable "box" so the nested closure below can write
+    # into it (donor_z[0] = ...) without needing `nonlocal` -- same trick as the
+    # attn_data dict elsewhere in this file, just for a single tensor instead of a dict.
     donor_z = [None]
     
     def make_capture_forward(target_block):
+        # Same recycle-loop structure as run_and_collect_attention() above, but this
+        # variant only captures z as it enters target_block (before that block's own
+        # processing) -- no bias/attention computation needed here.
         def forward(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
             device = seq_feats.device
             s_s_0, s_z_0 = seq_feats, pair_feats
@@ -474,6 +578,10 @@ def get_donor_z_at_block(
                 
                 for block_idx, block in enumerate(self.blocks):
                     if block_idx == target_block:
+                        # Capture z as it enters target_block, i.e. after blocks
+                        # 0..target_block-1 have processed it but before target_block
+                        # itself runs -- matching where apply_pairwise_patch() later
+                        # splices this donor z into the target's forward pass.
                         donor_z[0] = z.detach().cpu()
                     s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
                 
@@ -541,9 +649,12 @@ def run_patched_and_collect_attention(
     d_start, d_end = donor_region
     
     # Get donor z at patch block
+    # (step 1 of 3: capture the donor's pairwise representation right before patch_block)
     donor_z = get_donor_z_at_block(model, tokenizer, device, donor_sequence, patch_block)
     
     # Create pairwise mask
+    # (step 2 of 3: build the boolean footprint, in target coordinates, that will be
+    # overwritten with donor values)
     pairwise_mask = create_pairwise_mask(
         donor_start=d_start,
         donor_end=d_end,
@@ -556,6 +667,8 @@ def run_patched_and_collect_attention(
     
     attn_data = {'bias': {}, 'attn_with_bias': {}, 'attn_without_bias': {}}
     
+    # (step 3 of 3: run the target forward pass with the patch active, collecting
+    # bias + attention at every requested analysis block along the way)
     with patch_pairwise_and_collect_attention(
         model, donor_z, t_start, t_end, d_start,
         pairwise_mask, patch_block, analysis_blocks, attn_data,
@@ -565,10 +678,11 @@ def run_patched_and_collect_attention(
             outputs = model(**inputs, num_recycles=0)
     
     # Compute contact map
+    # (of the PATCHED structure prediction, for downstream metrics)
     ca_positions = outputs.positions[-1, 0, :, 1, :]
     diff = ca_positions.unsqueeze(0) - ca_positions.unsqueeze(1)
     distances = torch.sqrt((diff ** 2).sum(-1))
-    contact_map = (distances < 8.0).float()
+    contact_map = (distances < 8.0).float()  # 8 Å Cα-Cα contact cutoff
     
     collector = AttentionCollector()
     collector.bias = attn_data['bias']
@@ -592,23 +706,29 @@ def compute_attention_to_contacts(
     attn = attn[0]  # Remove batch
     region_len = region_end - region_start
     
+    # Average over attention heads -> single scalar attention weight per (i, j) pair.
     region_attn = attn[region_start:region_end, region_start:region_end, :].mean(dim=-1)
     region_contacts = contact_map[region_start:region_end, region_start:region_end]
     
+    # Exclude the diagonal: a residue is trivially "in contact" with itself, which
+    # isn't a meaningful structural signal for this analysis.
     mask = ~torch.eye(region_len, dtype=torch.bool)
     attn_flat = region_attn[mask]
     contacts_flat = region_contacts[mask]
     
-    contact_mask = contacts_flat > 0.5
+    contact_mask = contacts_flat > 0.5  # contact_map is a 0/1 float tensor
     noncontact_mask = ~contact_mask
     
     results = {}
     results['mean_attn_to_contacts'] = attn_flat[contact_mask].mean().item() if contact_mask.sum() > 0 else 0.0
     results['mean_attn_to_noncontacts'] = attn_flat[noncontact_mask].mean().item() if noncontact_mask.sum() > 0 else 0.0
-    results['attn_contact_ratio'] = results['mean_attn_to_contacts'] / (results['mean_attn_to_noncontacts'] + 1e-8)
+    results['attn_contact_ratio'] = results['mean_attn_to_contacts'] / (results['mean_attn_to_noncontacts'] + 1e-8)  # +eps avoids div-by-zero
     
     if contact_mask.sum() > 0 and noncontact_mask.sum() > 0:
         try:
+            # roc_auc_score(y_true, y_score): treats received attention as the "score"
+            # predicting the binary contact label. Needs both classes present, hence
+            # the guard above and the try/except (roc_auc_score raises otherwise).
             results['attn_contact_auc'] = roc_auc_score(contacts_flat.numpy(), attn_flat.numpy())
         except:
             results['attn_contact_auc'] = None
@@ -630,10 +750,12 @@ def compute_attention_alignment_with_foreign_contacts(
     
     region_attn = attn[region_start:region_end, region_start:region_end, :].mean(dim=-1)
     
+    # "own" = target's native contacts; "foreign" = donor's contacts (from the region
+    # the patch came from), both expressed in the same (region-local) coordinate frame.
     own_region = own_contacts[:region_len, :region_len]
     foreign_region = foreign_contacts[:region_len, :region_len]
     
-    mask = ~torch.eye(region_len, dtype=torch.bool)
+    mask = ~torch.eye(region_len, dtype=torch.bool)  # exclude diagonal (self-pairs)
     attn_flat = region_attn[mask]
     own_flat = own_region[mask]
     foreign_flat = foreign_region[mask]
@@ -642,6 +764,9 @@ def compute_attention_alignment_with_foreign_contacts(
     
     own_contact_mask = own_flat > 0.5
     foreign_contact_mask = foreign_flat > 0.5
+    # Set-difference logic: contacts unique to one map but absent from the other.
+    # This isolates the key causal question -- after patching, does attention shift
+    # toward contacts that are ONLY in the donor's map (not already a target contact)?
     unique_foreign = foreign_contact_mask & ~own_contact_mask
     unique_own = own_contact_mask & ~foreign_contact_mask
     
@@ -651,6 +776,7 @@ def compute_attention_alignment_with_foreign_contacts(
     results['mean_attn_to_unique_own'] = attn_flat[unique_own].mean().item() if unique_own.sum() > 0 else 0.0
     
     # AUCs
+    # (how well attention, as a score, predicts foreign contacts / own contacts respectively)
     if foreign_contact_mask.sum() > 0 and (~foreign_contact_mask).sum() > 0:
         try:
             results['attn_foreign_auc'] = roc_auc_score(foreign_flat.numpy(), attn_flat.numpy())
@@ -664,6 +790,10 @@ def compute_attention_alignment_with_foreign_contacts(
             results['attn_own_auc'] = None
     
     # Percent changes if baseline provided
+    # baseline_attn is expected to be the UN-patched target's own attention at the same
+    # positions; comparing against it quantifies how much attention shifted as a
+    # specific result of the patching intervention (vs. just being attention that
+    # happens to already favor these positions).
     if baseline_attn is not None:
         baseline = baseline_attn[0]
         baseline_region = baseline[region_start:region_end, region_start:region_end, :].mean(dim=-1)
@@ -672,7 +802,7 @@ def compute_attention_alignment_with_foreign_contacts(
         if foreign_contact_mask.sum() > 0:
             baseline_to_foreign = baseline_flat[foreign_contact_mask].mean().item()
             results['baseline_attn_to_donor_contacts'] = baseline_to_foreign
-            if baseline_to_foreign > 1e-8:
+            if baseline_to_foreign > 1e-8:  # guard against div-by-zero / noisy % on tiny baselines
                 results['pct_change_attn_to_donor_contacts'] = (
                     (results['mean_attn_to_foreign_contacts'] - baseline_to_foreign) / baseline_to_foreign * 100
                 )
@@ -721,11 +851,13 @@ def visualize_three_way_comparison(
     case_name: str = "",
 ):
     """Visualize attention patterns for donor, target, and patched runs."""
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))  # 2 rows x 4 cols grid
     
     d_start, d_end = donor_region
     t_start, t_end = target_region
     
+    # Average over attention heads for each of the three runs (donor / unpatched
+    # target / patched target), restricted to each run's own hairpin region.
     donor_region_attn = donor_attn[0, d_start:d_end, d_start:d_end, :].mean(dim=-1).numpy()
     target_region_attn = target_attn[0, t_start:t_end, t_start:t_end, :].mean(dim=-1).numpy()
     patched_region_attn = patched_attn[0, t_start:t_end, t_start:t_end, :].mean(dim=-1).numpy()
@@ -736,6 +868,8 @@ def visualize_three_way_comparison(
     # Row 1: Attention patterns
     ax = axes[0, 0]
     im = ax.imshow(donor_region_attn, cmap='Blues', aspect='auto')
+    # contour at level 0.5 traces the boundary of the binary (0/1) contact map,
+    # overlaying the contact-map outline on top of the continuous attention heatmap.
     ax.contour(donor_contacts_np, levels=[0.5], colors='lime', linewidths=2)
     ax.set_title('Donor Attention\n(green = donor contacts)')
     plt.colorbar(im, ax=ax, fraction=0.046)
@@ -748,6 +882,8 @@ def visualize_three_way_comparison(
     
     ax = axes[0, 2]
     im = ax.imshow(patched_region_attn, cmap='Blues', aspect='auto')
+    # Donor and target hairpin regions can have different lengths, so crop both
+    # contact maps to the smaller shape to overlay them on the same axes.
     min_size = min(donor_contacts_np.shape[0], patched_region_attn.shape[0])
     donor_overlay = donor_contacts_np[:min_size, :min_size]
     target_overlay = target_contacts_np[:min_size, :min_size]
@@ -758,6 +894,8 @@ def visualize_three_way_comparison(
     
     ax = axes[0, 3]
     diff = patched_region_attn - target_region_attn
+    # Floor of 0.01 avoids a degenerate (all-white) color scale when patched and
+    # target attention are nearly identical.
     vmax = max(abs(diff.min()), abs(diff.max()), 0.01)
     im = ax.imshow(diff, cmap='RdBu_r', aspect='auto', vmin=-vmax, vmax=vmax)
     ax.set_title('Patched - Target')
@@ -778,6 +916,8 @@ def visualize_three_way_comparison(
     ax.set_title('Donor - Target Contacts')
     
     ax = axes[1, 3]
+    # Scatter: does the per-pair change in contact status (donor vs target) correlate
+    # with the per-pair change in attention (patched vs target)? Diagonal excluded again.
     min_size = min(diff.shape[0], contact_diff.shape[0])
     diff_flat = diff[:min_size, :min_size].flatten()
     contact_diff_flat = contact_diff[:min_size, :min_size].flatten()
@@ -799,6 +939,8 @@ def visualize_attention_shift_summary(metrics_df: pd.DataFrame, output_path: str
     """Visualize attention shifts across blocks."""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
+    # Average every numeric metric across all donor/target cases, per block, to get
+    # one aggregate summary curve per metric as a function of trunk depth.
     numeric_cols = [c for c in metrics_df.select_dtypes(include=[np.number]).columns if c != 'block_idx']
     by_block = metrics_df.groupby('block_idx')[numeric_cols].mean().reset_index()
     
@@ -850,7 +992,7 @@ def visualize_attention_shift_summary(metrics_df: pd.DataFrame, output_path: str
     if 'attn_own_auc' in by_block.columns:
         ax.plot(by_block['block_idx'], by_block['attn_own_auc'],
                 's-', label='Target AUC', color='red')
-    ax.axhline(y=0.5, color='gray', linestyle='--')
+    ax.axhline(y=0.5, color='gray', linestyle='--')  # 0.5 = chance-level AUC (no predictive power)
     ax.set_xlabel('Block')
     ax.set_ylabel('AUC')
     ax.set_title('Attention as Contact Predictor')
@@ -868,12 +1010,17 @@ def visualize_attention_shift_summary(metrics_df: pd.DataFrame, output_path: str
 # ============================================================================
 
 def parse_args():
+    """Parse command-line arguments for the attention bias patching analysis."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--csv', type=str, default='data/block_patching_successes.csv')
     parser.add_argument('--output', type=str, default='attention_analysis_v2')
     parser.add_argument('--n-cases', type=int, default=5)
     parser.add_argument('--patch-block', type=int, default=27)
+    # Default analysis blocks span mid-to-late trunk depth (block 27, where the patch
+    # is applied, through the final block 47), to see how the causal effect of
+    # patching at block 27 propagates through later blocks.
     parser.add_argument('--analysis-blocks', type=int, nargs='+', default=[27, 30, 35, 40, 45, 47])
+    # The three patch footprint modes implemented in create_pairwise_mask().
     parser.add_argument('--patch-mask-mode', type=str, default='intra', choices=['touch', 'intra', 'hole'])
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--flush-every', type=int, default=5)
@@ -881,26 +1028,30 @@ def parse_args():
 
 
 def main():
+    """Entry point: run donor/target/patched attention analysis over CSV-listed cases and save metrics + plots."""
     args = parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     os.makedirs(args.output, exist_ok=True)
     
-    print("Loading model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    model, tokenizer = load_esmfold(device)
     
     print(f"Loading data from {args.csv}...")
     df = pd.read_csv(args.csv)
     
     # Filter for pairwise patches with hairpins found at patch_block
+    # Reuses cases from a prior block_patching.py run (block_patching_successes.csv)
+    # where patching at this same block_idx was already confirmed to induce a hairpin,
+    # rather than analyzing a fresh/unconstrained sample of donor-target pairs.
     df_filtered = df[
         (df['patch_mode'] == 'pairwise') & 
         (df['hairpin_found'] == True) & 
         (df['block_idx'] == args.patch_block)
     ]
     
+    # The source CSV has one row per analysis block, so after restricting to a single
+    # block_idx, drop_duplicates collapses back down to the unique donor/target cases.
     pairs = df_filtered[['donor_pdb', 'donor_sequence', 'donor_hairpin_start', 'donor_hairpin_end',
                          'target_name', 'target_sequence', 'target_start', 'target_end']].drop_duplicates()
     pairs = pairs.head(args.n_cases)
@@ -981,10 +1132,18 @@ def main():
             all_metrics.append(metrics)
         
         # Flush periodically
+        # NOTE: possible bug -- `idx` here is the original DataFrame row label from
+        # `pairs.iterrows()` (pairs was built via drop_duplicates()+head(), which does
+        # NOT reset the index), not a clean 0..len(pairs)-1 counter. So this does not
+        # reliably flush every `flush_every` *cases*; it flushes whenever the original
+        # (possibly sparse/non-contiguous) row label happens to be divisible by it.
         if (len(all_metrics) > 0) and (idx % args.flush_every == 0):
             interim_df = pd.DataFrame(all_metrics)
             interim_df.to_csv(results_path, index=False)
         
+        # Release cached (but unused) GPU memory between cases -- each case's
+        # collected attention tensors (one per analysis block) can be sizeable, so
+        # this avoids slow memory accumulation / OOM over many cases.
         torch.cuda.empty_cache()
     
     # Final save
@@ -1002,9 +1161,12 @@ def main():
     for block_idx in args.analysis_blocks:
         block_data = metrics_df[metrics_df['block_idx'] == block_idx]
         if len(block_data) > 0:
+            # .get(col, default) guards against the column being entirely absent
+            # (e.g. if no case had any unique-donor/unique-target contacts at all).
             pct_donor = block_data.get('pct_change_attn_to_unique_donor', pd.Series([None])).mean()
             pct_target = block_data.get('pct_change_attn_to_unique_target', pd.Series([None])).mean()
             
+            # .mean() over an all-None/empty column yields NaN; skip printing those.
             if pd.notna(pct_donor) and pd.notna(pct_target):
                 print(f"Block {block_idx}: Donor contacts {pct_donor:+.1f}%, Target contacts {pct_target:+.1f}%")
     

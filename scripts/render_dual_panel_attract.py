@@ -54,8 +54,8 @@ def render_pymol_frames(pdb_folder, frame_dir, magnitudes, pw, ph,
     Render each frame with strand1=blue, strand2=red, turn=splitpea.
     """
 
-    mag_list = json.dumps(magnitudes.tolist())
-    dm = display_max if display_max is not None else float(magnitudes.max())
+    mag_list = json.dumps(magnitudes.tolist())  # serialize for embedding into the generated PyMOL script string
+    dm = display_max if display_max is not None else float(magnitudes.max())  # upper end of the color/t normalization range
 
     pymol_script = f'''
 import os, glob, json
@@ -81,6 +81,8 @@ def strand2_rgb(t):
     b = 0.85 - t * 0.70
     return [r, g, b]
 
+# Loading every frame into one multi-state object lets a single zoom/orient call below
+# derive one consistent camera view that fits every conformation in the sweep
 # Load all as states of one object
 for i, pdb_path in enumerate(pdb_files):
     if i == 0:
@@ -106,11 +108,11 @@ cmd.set("ray_trace_mode", 1)
 cmd.set("ray_opaque_background", 1)
 cmd.bg_color("white")
 
-n_states = cmd.count_states("sweep")
+n_states = cmd.count_states("sweep")  # one state per input PDB frame
 
 for state in range(1, n_states + 1):
     mag = magnitudes[state - 1] if state - 1 < len(magnitudes) else magnitudes[-1]
-    t = max(0.0, min(1.0, (mag - mag_min) / (mag_max - mag_min + 1e-12)))
+    t = max(0.0, min(1.0, (mag - mag_min) / (mag_max - mag_min + 1e-12)))  # 1e-12 guards divide-by-zero if mag_min==mag_max
 
     cmd.create("frame", "sweep", source_state=state, target_state=1)
     cmd.hide("everything", "frame")
@@ -127,6 +129,8 @@ for state in range(1, n_states + 1):
     cmd.set_color("strand2_c", rgb2)
     cmd.color("strand2_c", f"frame and resi {strand2_resi}")
 
+    # Hide the multi-state object, show only the newly-colored single-state "frame",
+    # then re-apply the shared camera view so every frame renders from the same angle/zoom
     cmd.disable("sweep")
     cmd.enable("frame")
     cmd.set_view(saved_view)
@@ -169,8 +173,10 @@ def render_info_frames(frame_dir, magnitudes, seq,
     norm_max = display_max if display_max is not None else actual_max
 
     n_frames = len(magnitudes)
+    # NOTE: "hp" (hairpin) naming is left over from the beta-hairpin disruption script this
+    # was adapted from; here it just spans from strand1 start to strand2 end (helix-turn-helix)
     hp_start, hp_end = strand1_0, strand2_1
-    hp_len = hp_end - hp_start
+    hp_len = hp_end - hp_start  # NOTE: possible bug -- computed but never used below (dead variable)
     residues = list(range(hp_start, hp_end))
 
     fig_w, fig_h = pw / dpi, ph / dpi
@@ -178,9 +184,9 @@ def render_info_frames(frame_dir, magnitudes, seq,
     # Layout constants — 11 residues (4 + 3 + 4) with wide spacing
     spacing_factor = 3.4        # within-region residue spacing
     region_gap = 4.0            # extra gap between helix1/turn and turn/helix2
-    block_size = 3.6
-    y_offset = 4.0
-    sign_h_offset = -1.4
+    block_size = 3.6            # side length of each residue's colored square
+    y_offset = 4.0               # vertical center of the residue strip
+    sign_h_offset = -1.4         # horizontal nudge so +/- signs visually center over their region
 
     # Precompute x positions with gaps between regions
     def _build_x_positions(residues, strand1_0, strand1_1, turn_0, turn_1, strand2_0):
@@ -207,6 +213,10 @@ def render_info_frames(frame_dir, magnitudes, seq,
     print(f"Rendering {n_frames} info panels (Max Label: {actual_max})...")
 
     for idx, raw_mag in enumerate(magnitudes):
+        # NOTE: possible bug -- since actual_max=1.0 here, `raw_mag * actual_max == raw_mag`,
+        # so this ternary is a no-op regardless of which branch is taken. In the sibling
+        # disruption script (actual_max=0.19) the same pattern actually rescales values;
+        # this looks like vestigial logic left over from copying that script.
         display_mag = raw_mag if magnitudes.max() <= 0.2 else raw_mag * actual_max
         t = np.clip((display_mag - mag_min) / (norm_max - mag_min + 1e-12), 0, 1)
 
@@ -216,6 +226,8 @@ def render_info_frames(frame_dir, magnitudes, seq,
         sc_blend = tuple((a + b) / 2 for a, b in zip(sc1, sc2))
 
         fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
+        # 4 stacked rows (by height_ratio) map 1:1 to the 4 add_subplot(gs[N]) calls below:
+        # title, progress bar, sequence strip w/ arrows, equation caption
         gs = fig.add_gridspec(4, 1, height_ratios=[0.8, 0.4, 3.2, 1.2],
                               hspace=0.45, left=0.08, right=0.92, top=0.95, bottom=0.05)
 
@@ -264,12 +276,13 @@ def render_info_frames(frame_dir, magnitudes, seq,
                                  facecolor=color, edgecolor="white", linewidth=1.5, zorder=2)
             ax.add_patch(rect)
 
+            # Switch to white lettering once the strand box has darkened enough to need contrast
             is_dark = (region in ("strand1", "strand2")) and t > 0.25
             text_color = "white" if is_dark else "#333"
             ax.text(scaled_x, y_offset, aa, ha="center", va="center", fontsize=18,
                     fontweight="bold", color=text_color, zorder=3)
 
-            arrow_scale = t * 3.5
+            arrow_scale = t * 3.5  # arrow length grows with intervention magnitude t in [0,1]
             arrow_base_y_up = y_offset + (block_size / 2) + 1.0
             arrow_base_y_down = y_offset - (block_size / 2) - 2.5
 
@@ -320,6 +333,7 @@ def render_info_frames(frame_dir, magnitudes, seq,
                     ha="center", fontsize=18, color=sc_blend, style="italic")
 
         # ── Equation Subplot ────────────────────────
+        # Renders the steering-vector update rule as a figure caption for documentation
         ax = fig.add_subplot(gs[3])
         ax.axis("off")
         ax.text(0.5, 1.2, "s  ←  s  +  α · σ · d_charge", fontsize=20, ha="center",
@@ -328,7 +342,7 @@ def render_info_frames(frame_dir, magnitudes, seq,
                 fontsize=15, ha="center", color="black", style="italic")
 
         fig.savefig(os.path.join(frame_dir, f"info_{idx:04d}.png"), dpi=dpi)
-        plt.close(fig)
+        plt.close(fig)  # free the figure -- otherwise memory grows unbounded over hundreds of frames
 
 
 # ── Composite ──────────────────────────────────────────────────────
@@ -350,10 +364,12 @@ def composite_frames(frame_dir, n_frames):
         pymol_img = Image.open(pymol_path).convert("RGB")
         info_img  = Image.open(info_path).convert("RGB")
 
+        # Canvas is wide enough for both panels side-by-side, tall enough for the taller of the two
         canvas_h = max(pymol_img.height, info_img.height)
         canvas_w = pymol_img.width + info_img.width
 
         composite = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+        # Center each panel vertically in case the two panels differ in height
         pymol_y = (canvas_h - pymol_img.height) // 2
         info_y  = (canvas_h - info_img.height) // 2
 
@@ -368,15 +384,16 @@ def composite_frames(frame_dir, n_frames):
 # ── ffmpeg ──────────────────────────────────────────────────────────
 
 def stitch_video(frame_dir, output_mp4, fps):
+    """Encode the composited final_%04d.png frame sequence into an H.264 MP4 via ffmpeg."""
     print(f"\nStitching video ({fps} fps)...")
     subprocess.run([
-        "ffmpeg", "-y",
+        "ffmpeg", "-y",  # -y: overwrite output_mp4 if it already exists
         "-framerate", str(fps),
         "-i", os.path.join(frame_dir, "final_%04d.png"),
-        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",  # libx264 requires even width/height
         "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-crf", "18",
+        "-pix_fmt", "yuv420p",  # widest compatibility across players
+        "-crf", "18",  # visually-lossless quality
         output_mp4,
     ], check=True)
 
@@ -384,6 +401,7 @@ def stitch_video(frame_dir, output_mp4, fps):
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
+    """Parse args, load/derive per-frame magnitudes, render both panels, then composite and encode the video."""
     parser = argparse.ArgumentParser(
         description="Render dual-panel helix-turn-helix ATTRACTION animation"
     )
@@ -419,6 +437,8 @@ def main():
     print(f"Found {n_frames} PDB files")
     print(f"Output: {args.output} ({args.width*2}x{args.height} @ {args.fps} fps)")
 
+    # magnitudes.npy is expected to be saved alongside the frame_*.pdb files by whatever
+    # upstream sweep-generation process produced them
     mag_path = os.path.join(args.pdb_folder, "magnitudes.npy")
     if os.path.exists(mag_path):
         magnitudes = np.load(mag_path)
@@ -428,22 +448,25 @@ def main():
         magnitudes = np.linspace(0, 1, n_frames)
         print("No magnitudes.npy — using linear ramp")
 
+    # Guard against a mismatched frame/magnitude count (e.g. a partially-written sweep)
     if len(magnitudes) != n_frames:
         n_frames = min(len(magnitudes), n_frames)
         magnitudes = magnitudes[:n_frames]
         print(f"Truncated to {n_frames} frames")
 
+    # Parse "N-M" 1-indexed inclusive residue ranges from the CLI
     s1a, s1b = [int(x) for x in args.strand1.split("-")]
     ta, tb   = [int(x) for x in args.turn.split("-")]
     s2a, s2b = [int(x) for x in args.strand2.split("-")]
 
+    # Convert each 1-indexed inclusive range [a, b] to a 0-indexed half-open range [a-1, b)
     strand1_0, strand1_1 = s1a - 1, s1b
     turn_0, turn_1       = ta - 1, tb
     strand2_0, strand2_1 = s2a - 1, s2b
 
     display_max = args.max_std if args.max_std is not None else magnitudes.max()
 
-    frame_dir = tempfile.mkdtemp(prefix="dual_panel_attract_")
+    frame_dir = tempfile.mkdtemp(prefix="dual_panel_attract_")  # scratch dir for per-frame PNGs before video encoding
 
     try:
         render_pymol_frames(
@@ -466,6 +489,8 @@ def main():
         print(f"\nDone! → {args.output}")
 
     finally:
+        # Always clean up the scratch directory (intermediate PNGs + generated PyMOL script),
+        # even if rendering/encoding raised an exception above
         for f in glob.glob(os.path.join(frame_dir, "*.png")):
             os.remove(f)
         for f in glob.glob(os.path.join(frame_dir, "*.py")):

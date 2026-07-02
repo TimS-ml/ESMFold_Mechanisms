@@ -54,6 +54,7 @@ from transformers.models.esm.openfold_utils import (
 )
 from transformers.utils import ContextManagers, ModelOutput
 from src.utils.trunk_utils import detect_hairpins
+from src.utils.model_utils import load_esmfold
 # ============================================================================
 # Alpha Helix Content Calculation
 # ============================================================================
@@ -67,12 +68,17 @@ def compute_alpha_helix_content(pdb_string: str) -> Tuple[Optional[int], Optiona
     """
     import tempfile
     
+    # Guarded/lazy import so this module can still be imported in environments
+    # without the DSSP-related utilities installed (helix computation is optional).
     try:
         from src.utils.trunk_utils import run_dssp_on_pdb
     except ImportError:
         print("Warning: utils.trunk_utils not found, cannot compute helix content")
         return None, None, None
     
+    # DSSP needs a real file path, so the in-memory PDB string is written to a temp
+    # file first. delete=False keeps the file on disk after this `with` block exits
+    # (required on some platforms to let DSSP reopen it); it is removed manually below.
     with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode='w') as f:
         f.write(pdb_string)
         pdb_path = f.name
@@ -95,6 +101,9 @@ def compute_alpha_helix_content(pdb_string: str) -> Tuple[Optional[int], Optiona
         return None, None, None
     finally:
         # Clean up temp file
+        # Runs regardless of whether DSSP succeeded or raised above; the bare
+        # except suppresses cleanup errors (e.g. file already gone) so they
+        # don't mask/replace whatever exception was being handled.
         import os
         try:
             os.unlink(pdb_path)
@@ -109,6 +118,10 @@ def compute_alpha_helix_content(pdb_string: str) -> Tuple[Optional[int], Optiona
 @dataclass
 class NewEsmForProteinFoldingOutput(ModelOutput):
     """Extended output class that includes per-block representations."""
+    # All fields below mirror `EsmForProteinFoldingOutput` from transformers exactly,
+    # EXCEPT `s_s_list`/`s_z_list` at the bottom, which are new: they hold the
+    # sequence/pairwise representation after every trunk block (not just the final
+    # one), populated by the monkey-patched trunk forwards below.
     frames: Optional[torch.FloatTensor] = None
     sidechain_frames: Optional[torch.FloatTensor] = None
     unnormalized_angles: Optional[torch.FloatTensor] = None
@@ -139,28 +152,58 @@ class NewEsmForProteinFoldingOutput(ModelOutput):
 # ============================================================================
 # Monkey-patched Forward Functions
 # ============================================================================
+# The experiments below need to change what happens INSIDE a trunk block's
+# forward pass (e.g. skip one specific cross-stream term, or splice in donor
+# activations mid-block) -- not just read/modify tensors flowing in and out of
+# it. Standard PyTorch forward hooks (`register_forward_hook`) only see a
+# module's final input/output, not its internal control flow, so they can't
+# express "skip this one line of math but run everything else normally".
+# Instead, this file replaces the bound `forward` method on specific
+# `nn.Module` instances at runtime ("monkey-patching"):
+#
+#     block.forward = types.MethodType(new_forward_fn, block)
+#
+# `types.MethodType(fn, obj)` binds a plain function `fn(self, ...)` to the
+# instance `obj`, giving a bound method equivalent to `obj.fn(...)`. Assigning
+# it to `obj.forward` creates an INSTANCE attribute that shadows the class's
+# own `forward` method. Since `nn.Module.__call__` internally dispatches to
+# `self.forward(...)`, calling `obj(...)` afterwards runs `new_forward_fn`
+# instead of the original class method -- with no change to `obj`'s
+# parameters/weights, and no effect on any other (unpatched) instance of the
+# same class. Below, `collect_block_representations`/`patch_s_representations_in_trunk`
+# stand in for `EsmFoldingTrunk.forward`, `return_block_representations`/
+# `high_forward_pass` stand in for `EsmForProteinFolding.forward`, and
+# `ablate_bridges` (further down) stands in for
+# `EsmFoldTriangularSelfAttentionBlock.forward` -- each written as a plain
+# function taking `self` as its first argument so it can be bound this way.
+# ============================================================================
 
 def collect_block_representations(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
     """
     Modified trunk forward that collects representations from each block.
     """
     device = seq_feats.device
-    s_s_0 = seq_feats
-    s_z_0 = pair_feats
+    s_s_0 = seq_feats  # recycle-0 (original) sequence repr, kept separate so
+    s_z_0 = pair_feats  # each recycle iteration below can add it back in fresh
 
     if no_recycles is None:
         no_recycles = self.config.max_recycles
     else:
         if no_recycles < 0:
             raise ValueError("Number of recycles must not be negative.")
-        no_recycles += 1
+        no_recycles += 1  # first "recycle" is just the initial forward pass
 
     def trunk_iter(s, z, residx, mask):
+        """Run every trunk block once (in order), recording each block's (s, z) output."""
         z = z + self.pairwise_positional_embedding(residx, mask=mask)
         s_s_list = []
         s_z_list = []
         for block in self.blocks:
             s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
+            # Unlike the stock EsmFoldingTrunk.forward (which only keeps the
+            # final s/z), snapshot every block's output here -- this is exactly
+            # the per-block "donor" activation history later grafted into a
+            # different sequence's forward pass at a matching block index.
             s_s_list.append(s)
             s_z_list.append(z)
         return s, z, s_s_list, s_z_list
@@ -178,6 +221,10 @@ def collect_block_representations(self, seq_feats, pair_feats, true_aa, residx, 
             recycle_z = self.recycle_z_norm(recycle_z.detach()).to(device)
             recycle_z += self.recycle_disto(recycle_bins.detach()).to(device)
 
+            # NOTE: sequence_list/pairwise_list are overwritten every recycle
+            # iteration, so only the LAST recycle's per-block snapshots survive
+            # past this loop. Harmless here since every caller in this script
+            # passes num_recycles=0 (-> no_recycles=1, a single iteration).
             s_s, s_z, sequence_list, pairwise_list = trunk_iter(
                 s_s_0 + recycle_s, s_z_0 + recycle_z, residx, mask
             )
@@ -190,6 +237,10 @@ def collect_block_representations(self, seq_feats, pair_feats, true_aa, residx, 
 
             recycle_s = s_s
             recycle_z = s_z
+            # 3.375 / 21.375 (Angstroms) are the min/max Cbeta-Cbeta distance-bin
+            # edges used to discretize the predicted coordinates into
+            # `self.recycle_bins` (=15) bins for the next recycle's distance
+            # conditioning -- identical constants to the stock trunk.
             recycle_bins = EsmFoldingTrunk.distogram(
                 structure["positions"][-1][:, :, :3],
                 3.375,
@@ -199,6 +250,8 @@ def collect_block_representations(self, seq_feats, pair_feats, true_aa, residx, 
 
     structure["s_s"] = s_s
     structure["s_z"] = s_z
+    # Attach the per-block lists onto the returned dict so they survive being
+    # wrapped into NewEsmForProteinFoldingOutput by the caller (return_block_representations).
     structure['s_s_list'] = sequence_list
     structure['s_z_list'] = pairwise_list
 
@@ -215,6 +268,15 @@ def return_block_representations(
     output_hidden_states: Optional[bool] = False,
 ) -> NewEsmForProteinFoldingOutput:
     """Modified forward that returns block-level representations."""
+    # This is a near-verbatim clone of the stock EsmForProteinFolding.forward
+    # (ESM backbone -> s/z init -> trunk -> output heads). The only functional
+    # differences from stock are: (1) "s_s_list"/"s_z_list" are kept in the
+    # filtered structure dict below, and (2) the result is wrapped in
+    # NewEsmForProteinFoldingOutput instead of EsmForProteinFoldingOutput.
+    # Everything else must stay identical so this still IS a normal forward
+    # pass, just with extra per-block activations exposed. Must be paired with
+    # `model.trunk.forward = types.MethodType(collect_block_representations, ...)`,
+    # since that's the trunk implementation that actually produces s_s_list/s_z_list.
     cfg = self.config.esmfold_config
 
     aa = input_ids
@@ -236,14 +298,21 @@ def return_block_representations(
         mlm_targets = None
 
     esm_s = self.compute_language_model_representations(esmaa)
-    esm_s = esm_s.to(self.esm_s_combine.dtype)
+    esm_s = esm_s.to(self.esm_s_combine.dtype)  # cast ESM backbone output back to the trunk's (fp32) dtype
 
     if cfg.esm_ablate_sequence:
+        # Stock ESMFold config flag that zeroes the WHOLE ESM sequence signal --
+        # a coarser, model-level ablation unrelated to this file's own
+        # block-level bridge ablation (ablate_bridges) below.
         esm_s = esm_s * 0
 
-    esm_s = esm_s.detach()
+    esm_s = esm_s.detach()  # ESM backbone is frozen; stop gradients (no-op at inference)
+    # Learned per-layer softmax weights linearly combine the stacked per-layer
+    # ESM-2 hidden states into a single c_s-width sequence representation.
     esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2)
     s_s_0 = self.esm_s_mlp(esm_s)
+    # Pairwise repr always starts at all-zeros: ESM only supplies a per-residue
+    # signal, so the trunk blocks are what first build structure into z from s.
     s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)
 
     if self.config.esmfold_config.embed_aa:
@@ -253,6 +322,8 @@ def return_block_representations(
         s_s_0, s_z_0, aa, position_ids, attention_mask, no_recycles=num_recycles
     )
     
+    # Keep only the keys downstream code needs -- same filtering as stock code,
+    # with "s_s_list"/"s_z_list" added so the per-block history survives.
     structure = {
         k: v for k, v in structure.items()
         if k in [
@@ -264,6 +335,8 @@ def return_block_representations(
     if mlm_targets:
         structure["mlm_targets"] = mlm_targets
 
+    # --- From here down, identical to stock EsmForProteinFolding.forward: ---
+    # distogram/LM/pTM/pLDDT output heads applied to the trunk's final s_s/s_z.
     disto_logits = self.distogram_head(structure["s_z"])
     disto_logits = (disto_logits + disto_logits.transpose(1, 2)) / 2
     structure["distogram_logits"] = disto_logits
@@ -295,6 +368,25 @@ def return_block_representations(
 
 #Patch block
 
+# `ablate_bridges` is a drop-in replacement for the stock
+# `EsmFoldTriangularSelfAttentionBlock.forward` (same validation + math as the
+# original, copied below) with two added boolean switches that let a caller
+# selectively CUT one or both of the two places where information crosses
+# between the sequence stream (s) and the pairwise stream (z) inside this one
+# block, while leaving each stream's own internal computation untouched:
+#   - ablate_pair_to_seq=True: skip `pair_to_sequence(pairwise_state)` (the
+#     z-derived attention bias normally fed into s's self-attention). s's
+#     self-attention this block then sees NO information from z at all.
+#   - ablate_seq_to_pair=True: skip adding `sequence_to_pair(sequence_state)`
+#     into z, leaving z completely unchanged by s this block.
+# s's self-attention/MLP and z's triangular multiplicative updates/triangular
+# attention/MLP (each purely intra-stream, not dependent on the other stream)
+# still run normally regardless of these flags -- only the two CROSS-stream
+# coupling terms are affected. With both flags at their default (False), this
+# function is numerically identical to the original block forward, which is
+# what makes it safe to monkey-patch onto EVERY block up front (see
+# `run_ablation_experiment` below) and only "activate" ablation selectively,
+# per call, via these extra kwargs (see `patch_s_representations_in_trunk`).
 def ablate_bridges(self, sequence_state, pairwise_state, mask=None, chunk_size=None, ablate_pair_to_seq = False, ablate_seq_to_pair = False, **__kwargs):
         """
         Inputs:
@@ -336,6 +428,8 @@ def ablate_bridges(self, sequence_state, pairwise_state, mask=None, chunk_size=N
             )
 
         if ablate_pair_to_seq:
+            # Cut the z -> s bridge for this block: no pairwise-derived bias
+            # reaches the sequence self-attention below.
             # Update sequence state
             bias = None
         else:
@@ -349,6 +443,8 @@ def ablate_bridges(self, sequence_state, pairwise_state, mask=None, chunk_size=N
 
         # Update pairwise state
         if ablate_seq_to_pair:
+            # Cut the s -> z bridge for this block: z passes through this
+            # block completely unchanged by s (skip the additive update).
             pairwise_state = pairwise_state
         else:
             pairwise_state = pairwise_state + self.sequence_to_pair(sequence_state)
@@ -378,6 +474,11 @@ def patch_s_representations_in_trunk(
     Args:
         ablate_block_indices: List of block indices where ablation should be applied (can be None or empty)
     """
+    # Replacement for EsmFoldingTrunk.forward used during the actual sliding-
+    # window-ablation inference passes. Combines two independent interventions
+    # in one trunk pass: (1) donor-activation patching at exactly one block
+    # (target_block), and (2) bridge ablation (via ablate_bridges kwargs)
+    # across a contiguous window of blocks (ablate_block_indices).
     device = seq_feats.device
     s_s_0 = seq_feats
     s_z_0 = pair_feats
@@ -393,22 +494,46 @@ def patch_s_representations_in_trunk(
         no_recycles += 1
 
     def apply_patch(block_idx, s_s, s_z):
+        """Overwrite the target's s and/or z at `block_idx` with donor activations, restricted to the patch region/mask."""
         if patch_mode in ('both', 'sequence'):
+            # donor_s_s_list[block_idx] was pre-sliced to ONLY the donor's
+            # hairpin-region columns when it was cached (see run_ablation_experiment),
+            # so its length along dim=1 is exactly donor_hairpin_end - donor_hairpin_start.
+            # The assert enforces a position-for-position copy: target patch
+            # region and donor hairpin must have the same residue count.
             donor_block_s_repr = donor_s_s_list[block_idx].to(s_s.device, dtype=s_s.dtype)
             donor_len = donor_block_s_repr.shape[1]
             target_len = target_end - target_start
             assert donor_len == target_len, f"Donor length mismatch: {donor_len} != {target_len}"
+            # In-place overwrite of only the target region's columns; positions
+            # outside [target_start:target_end) keep this block's own (possibly ablated) output.
             s_s[:, target_start:target_end, :] = donor_block_s_repr
             
         if patch_mode in ('both', 'pairwise'):
+            # Unlike the sequence donor list, donor_s_z_list was cached WITHOUT
+            # slicing (full L_donor x L_donor grid) -- see run_ablation_experiment --
+            # so absolute donor coordinates must be recovered via the offset below,
+            # rather than indexed directly like the sequence patch above.
             donor_z = donor_s_z_list[block_idx].to(s_z.device, dtype=s_z.dtype)
+            # Local var; shadows (but is unrelated to) the outer attention `mask`
+            # argument of patch_s_representations_in_trunk -- scoped to this closure only.
             mask = pairwise_mask.to(s_z.device)
 
             #apply mask: for each True position in mask, copy from corresponding donor representation
+            # Plain Python double loop over up to target_len^2 cells -- simple
+            # and correct, not vectorized, since patch masks here are small
+            # (single hairpin regions), not full L x L grids.
             for t_i in range(mask.shape[0]):
                 for t_j in range(mask.shape[1]):
                     if mask[t_i, t_j]:
                         #map target coords to donor coords via relative position
+                        # Re-base each target index through its own hairpin-start
+                        # offset into the donor's index space (target_start and
+                        # donor_hairpin_start both mark "start of hairpin region"
+                        # in their respective sequences). create_pairwise_mask's
+                        # transport range is bounded by min(donor side, target
+                        # side) on each side specifically so d_i/d_j below always
+                        # stay within the donor tensor's valid index range.
                         d_i = t_i - target_start + donor_hairpin_start
                         d_j = t_j - target_start + donor_hairpin_start
                         s_z[:, t_i, t_j, :] = donor_z[:, d_i, d_j, :]
@@ -416,20 +541,35 @@ def patch_s_representations_in_trunk(
         return s_s, s_z
 
     def trunk_iter(s, z, residx, mask):
+        """Run all trunk blocks once, ablating bridges on `ablate_blocks_set` blocks and patching donor activations in at `target_block`."""
         z = z + self.pairwise_positional_embedding(residx, mask=mask)
         s_s_list = []
         s_z_list = []
         for block_idx, block in enumerate(self.blocks):
             if block_idx in ablate_blocks_set:
+                # Only blocks inside the requested sliding window get the
+                # ablate_* kwargs; every other block below calls with the
+                # defaults (both False), so ablate_bridges behaves exactly
+                # like the un-ablated original there.
                 s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size, ablate_pair_to_seq=ablate_pair_to_seq, ablate_seq_to_pair=ablate_seq_to_pair)
             else:
                 s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
             if block_idx == target_block:
+                # Patching happens AFTER this block's own (possibly-ablated)
+                # computation, so donor activations REPLACE this block's output
+                # before it becomes the input to the NEXT block -- i.e. "run
+                # normally/ablated through target_block, splice in the donor's
+                # version of the patch region, then let the rest of the trunk
+                # propagate that forward."
                 s, z = apply_patch(block_idx, s, z)
             s_s_list.append(s)
             s_z_list.append(z)
         return s, z, s_s_list, s_z_list
 
+    # Recycle loop: identical mechanics to collect_block_representations above
+    # (recycle_s/recycle_z/recycle_bins zero-initialized, only the final
+    # recycle's per-block lists survive, num_recycles=0 everywhere in this
+    # script so this always runs exactly once) -- see comments there.
     s_s = s_s_0
     s_z = s_z_0
 
@@ -494,6 +634,11 @@ def high_forward_pass(
     Args:
         ablate_block_indices: List of block indices where ablation should be applied
     """
+    # Body is identical to return_block_representations above (see comments
+    # there) except that all the donor/patch/ablation kwargs are forwarded
+    # into self.trunk(...) below. Must be paired with
+    # `model.trunk.forward = types.MethodType(patch_s_representations_in_trunk, ...)`,
+    # since that's the only trunk forward that accepts these extra kwargs.
     cfg = self.config.esmfold_config
 
     aa = input_ids
@@ -528,6 +673,8 @@ def high_forward_pass(
     if self.config.esmfold_config.embed_aa:
         s_s_0 += self.embedding(masked_aa)
 
+    # Forward all patch/ablation parameters straight through to
+    # patch_s_representations_in_trunk (bound as self.trunk.forward).
     structure: dict = self.trunk(
         s_s_0, s_z_0, aa, position_ids, attention_mask, no_recycles=num_recycles,
         donor_s_s_list=donor_s_s_list, donor_s_z_list=donor_s_z_list,
@@ -590,17 +737,26 @@ def create_pairwise_mask(
     mode: str,
 ) -> torch.Tensor:
     """Create the pairwise patch mask."""
+    # Boolean L x L grid (L = target_len) marking which (i, j) pairwise cells
+    # get overwritten with donor activations in apply_patch, above.
     patch_mask = torch.zeros(target_len, target_len, dtype=torch.bool)
     
     if mode == "intra":
+        # Only pairs where BOTH residues fall inside the patch/hairpin region
+        # (contacts within the new hairpin itself).
         patch_mask[target_start:target_end, target_start:target_end] = True
         
     elif mode in ("touch", "hole"):
         # Compute transportable range
+        # How far outside the patch region (toward the N-terminus) the patch
+        # can safely extend, bounded by whichever sequence -- donor or target --
+        # has LESS room on that side. This guarantees the d_i/d_j offset
+        # mapping in apply_patch always lands inside the donor's valid index range.
         donor_left_extent = donor_hairpin_start
         target_left_extent = target_start
         left_extent = min(donor_left_extent, target_left_extent)
         
+        # Same idea for the C-terminal side.
         donor_right_extent = donor_len - donor_hairpin_end
         target_right_extent = target_len - target_end
         right_extent = min(donor_right_extent, target_right_extent)
@@ -609,10 +765,18 @@ def create_pairwise_mask(
         transport_end = target_end + right_extent
         
         # Create cross
+        # "+"-shaped region of the L x L grid: (hairpin rows x transport-range
+        # cols) plus its transpose (transport-range rows x hairpin cols) --
+        # i.e. every pairwise interaction between the hairpin and its extended
+        # neighborhood, in both directions (z is not symmetric).
         patch_mask[target_start:target_end, transport_start:transport_end] = True
         patch_mask[transport_start:transport_end, target_start:target_end] = True
         
         if mode == "hole":
+            # "hole" = same cross as "touch" but with the intra-hairpin block
+            # (the "intra" mode's region) carved back out -- isolates
+            # hairpin-to-neighborhood contacts while excluding the hairpin's
+            # contacts with itself.
             # Cut out intra-hairpin region
             patch_mask[target_start:target_end, target_start:target_end] = False
     
@@ -629,12 +793,17 @@ def visualize_pairwise_mask(
 ):
     """Save visualization of pairwise mask."""
     fig, ax = plt.subplots(figsize=figsize)
+    # Render the bool mask as a 0/1 heatmap; origin='upper' keeps row 0 at the
+    # top, matching the usual (i, j) convention for viewing an L x L pairwise grid.
     ax.imshow(patch_mask.numpy(), cmap='Greys', vmin=0, vmax=1, origin='upper')
     ax.set_xlabel('Residue Position (Target)')
     ax.set_ylabel('Residue Position (Target)')
     ax.set_title(f'Pairwise Patch Mask ({mode})\nHairpin region: [{target_start}:{target_end}]')
     
     from matplotlib.patches import Rectangle
+    # The -0.5 offset accounts for imshow cell centers sitting at integer
+    # coordinates, so the rectangle aligns with cell boundaries (rather than
+    # being off by half a cell) to outline the patch/hairpin region.
     rect = Rectangle((target_start - 0.5, target_start - 0.5),
                       target_end - target_start,
                       target_end - target_start,
@@ -668,10 +837,18 @@ def run_single_block_experiment_fast(
     """
     Run patching experiment - assumes donor representations are already extracted.
     """
+    # NOTE: this function is not called anywhere in this file's own main()/
+    # run_ablation_experiment() pipeline (which uses run_single_ablation_experiment
+    # instead) -- it appears to be a leftover/reusable helper carried over from
+    # an earlier single-block (non-sliding-window) patching experiment.
     results = []
     orig_helix_count, orig_total, orig_helix_pct = orig_helix_data
     
     for block_idx in range(num_blocks):
+        # Re-apply the model+trunk forward monkey-patch every iteration (cheap
+        # bound-method assignment); model.forward and model.trunk.forward must
+        # always be swapped together since high_forward_pass only works when
+        # paired with patch_s_representations_in_trunk (see comments above).
         model.forward = types.MethodType(high_forward_pass, model)
         model.trunk.forward = types.MethodType(patch_s_representations_in_trunk, model.trunk)
         
@@ -694,12 +871,18 @@ def run_single_block_experiment_fast(
             )
         
         # Clean up outputs
+        # Strip the extra per-block lists (not fields of the stock output
+        # class) before repackaging into EsmForProteinFoldingOutput, which
+        # detect_hairpins/model.output_to_pdb below expect.
         patched_outputs_dict = dict(patched_outputs)
         patched_outputs_dict.pop("s_s_list", None)
         patched_outputs_dict.pop("s_z_list", None)
         clean_outputs = EsmForProteinFoldingOutput(**patched_outputs_dict)
         
         # Check for hairpin using detect_hairpins
+        # Runs DSSP-based secondary-structure detection on the predicted
+        # structure; only the boolean is needed here, so the hairpin
+        # coordinate list (2nd return value) is discarded.
         hairpin_found, _ = detect_hairpins(clean_outputs, model)
         
         result = {
@@ -741,6 +924,9 @@ def run_single_block_experiment_fast(
                     f.write(pdb_string)
         
         results.append(result)
+        # Release this pass's freed activation memory back to the CUDA
+        # allocator so many repeated forward passes (one per block here) don't
+        # accumulate fragmented/reserved-but-unused GPU memory.
         torch.cuda.empty_cache()
     
     return results
@@ -753,6 +939,8 @@ def run_single_block_experiment_fast(
 def parse_patch_region(patch_region_str: str) -> Tuple[int, int]:
     """Parse target_patch_region string like '(11, 27)' to tuple."""
     import ast
+    # literal_eval safely parses a literal tuple/list/etc from a string
+    # without executing arbitrary code, unlike a plain eval().
     return ast.literal_eval(patch_region_str)
 
 
@@ -785,6 +973,9 @@ def run_single_ablation_experiment(
     """
     results = []
     
+    # The 3 (ablate_pair_to_seq, ablate_seq_to_pair) combinations actually
+    # tested per window: cut the z->s bridge only, the s->z bridge only, or
+    # both simultaneously, for every block in the current sliding window.
     ablation_types = [
         ("pair2seq", True, False),
         ("seq2pair", False, True),
@@ -792,6 +983,8 @@ def run_single_ablation_experiment(
     ]
     
     # Calculate total iterations for this case
+    # Precompute the total number of (window_size, window_start, ablation_type)
+    # combinations purely to size the progress bar below; not used elsewhere.
     total_iters = 0
     for window_size in window_sizes:
         max_start = num_blocks - window_size
@@ -804,13 +997,24 @@ def run_single_ablation_experiment(
     for window_size in window_sizes:
         # Sliding window starts at patch_block_idx and moves forward
         # Window can start at patch_block_idx up to (num_blocks - window_size)
+        # max_start is the last valid start so the window [start, start+size)
+        # never runs past the final block.
         max_start = num_blocks - window_size
         
         for window_start in range(patch_block_idx, max_start + 1):
+            # The window is only ever placed AT or AFTER patch_block_idx:
+            # ablating bridges before the donor patch is applied couldn't
+            # affect whether the patched information survives downstream, so
+            # only "how far after the patch does ablation still destroy the
+            # hairpin" is tested here.
             window_end = window_start + window_size  # exclusive
             ablate_block_indices = list(range(window_start, window_end))
             
             for ablation_name, ablate_pair_to_seq, ablate_seq_to_pair in ablation_types:
+                # Re-apply the paired model/trunk monkey-patch before every
+                # single forward pass (see the "Monkey-patched Forward
+                # Functions" section above for why model.forward and
+                # model.trunk.forward must always be swapped as a matched pair).
                 model.forward = types.MethodType(high_forward_pass, model)
                 model.trunk.forward = types.MethodType(patch_s_representations_in_trunk, model.trunk)
                 
@@ -819,6 +1023,11 @@ def run_single_ablation_experiment(
                         target_seq, return_tensors='pt', add_special_tokens=False
                     ).to(device)
                     
+                    # target_block is always patch_block_idx here (the block
+                    # where the original single-block patching experiment
+                    # succeeded) -- only the ablation window/type varies across
+                    # this sweep. num_recycles=0 keeps each of the many sweep
+                    # iterations to a single, directly-comparable trunk pass.
                     patched_outputs = model(
                         **target_inputs,
                         num_recycles=0,
@@ -858,6 +1067,10 @@ def run_single_ablation_experiment(
                 
                 results.append(result)
                 pbar.update(1)
+                # This is the hottest loop in the whole sweep (window_sizes x
+                # window_starts x 3 ablation_types forward passes per case) --
+                # empty_cache() here keeps GPU memory from fragmenting/growing
+                # across the many repeated forward passes.
                 torch.cuda.empty_cache()
     
     pbar.close()
@@ -896,28 +1109,34 @@ def run_ablation_experiment(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
-    # Load model
-    print("Loading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
-    model = model.to(device)
-    model.eval()
-    
+    # Load model via the shared helper (handles device placement + precision
+    # auto-detection; see src/utils/model_utils.py).
+    model, tokenizer = load_esmfold(device)
+
     # Monkey-patch the block forward to support ablation
+    # One-time, PERMANENT patch applied to every block right after loading and
+    # never reverted. This is safe to leave in place because ablate_bridges
+    # called with its default kwargs (both False) is behaviorally identical to
+    # the original block forward -- so blocks never targeted by a later
+    # ablate_block_indices window are completely unaffected.
     for block in model.trunk.blocks:
         block.forward = types.MethodType(ablate_bridges, block)
-    
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
-    print("Model loaded successfully")
     
     # Load results and filter to successful cases
     print(f"Loading results from {results_csv_path}...")
     df = pd.read_csv(results_csv_path)
     
     # Filter to only successful hairpin formations
+    # Ablation is only informative on cases that already produced a hairpin in
+    # the earlier single-block patching experiment -- there'd be nothing to
+    # (potentially) destroy otherwise. .copy() avoids pandas chained-indexing
+    # issues on the filtered view before the .head()/concat calls below.
     successful_df = df[df['hairpin_found'] == True].copy()
     print(f"Found {len(successful_df)} successful cases out of {len(df)} total")
     
     # Separate by patch mode and take specified number from each
+    # .head(n) takes the FIRST n rows in CSV order (not a random sample) --
+    # deterministic/reproducible, but whatever ordering bias the source CSV has.
     sequence_cases = successful_df[successful_df['patch_mode'] == 'sequence'].head(n_sequence_cases)
     pairwise_cases = successful_df[successful_df['patch_mode'] == 'pairwise'].head(n_pairwise_cases)
     
@@ -928,6 +1147,9 @@ def run_ablation_experiment(
     print(f"Total cases to run: {len(cases_to_run)}")
     
     # Parent columns to preserve (updated for new CSV format)
+    # Identifying/provenance columns copied from the source single-block-patching
+    # CSV onto every ablation-sweep result row below, so each output row can be
+    # traced back to its originating target/donor/patch-location case.
     parent_columns = [
         "case_idx", "target_name", "target_sequence", "target_length",
         "loop_idx", "loop_start", "loop_end", "loop_length", "loop_sequence",
@@ -955,6 +1177,10 @@ def run_ablation_experiment(
     
     for row_idx, row in cases_to_run.iterrows():
         case_id = f"ablate_case_{row_idx}"
+        # Broad catch-all around the whole per-case body: this sweep can run
+        # for hours over hundreds of cases, so one bad case (DSSP failure,
+        # malformed CSV row, shape mismatch, ...) shouldn't abort the entire
+        # run -- it's logged to skipped_cases and reported at the end instead.
         try:
         
             # Extract info from parent row (updated for new CSV format)
@@ -979,6 +1205,10 @@ def run_ablation_experiment(
             pbar.set_description(f"[{patch_mode[:3]}] {row['target_name'][:10]}<-{row['donor_pdb'][:6]}")
         
             # Get or compute donor representations
+            # Cache MISS: monkey-patch to the "collection" pair
+            # (return_block_representations / collect_block_representations)
+            # to run one forward pass over the donor sequence and record every
+            # block's s/z.
             if donor_seq not in donor_cache:
                 model.forward = types.MethodType(return_block_representations, model)
                 model.trunk.forward = types.MethodType(collect_block_representations, model.trunk)
@@ -988,12 +1218,18 @@ def run_ablation_experiment(
                     donor_outputs = model(**donor_inputs, num_recycles=0)
             
                 # Extract and cache
+                # Only keep the donor's hairpin-region COLUMNS of s, since that's
+                # the only part ever grafted into the target sequence's s
+                # (see apply_patch's "sequence" branch above).
                 donor_s_blocks = []
                 for block_repr in donor_outputs.s_s_list:
                     donor_s_blocks.append(
                         block_repr[:, donor_hairpin_start:donor_hairpin_end, :].detach().cpu()
                     )
             
+                # z is cached in FULL (no slicing) because "touch"/"hole" patch
+                # modes can reach beyond the hairpin region itself -- apply_patch
+                # recovers the right donor coordinates via an index offset instead.
                 donor_z_blocks = []
                 for block_repr in donor_outputs.s_z_list:
                     donor_z_blocks.append(block_repr.detach().cpu())
@@ -1006,6 +1242,7 @@ def run_ablation_experiment(
                 del donor_outputs
                 torch.cuda.empty_cache()
             else:
+                # Cache HIT: reuse the previously-extracted donor activations.
                 cached = donor_cache[donor_seq]
                 donor_s_blocks = cached['donor_s_blocks']
                 donor_z_blocks = cached['donor_z_blocks']
@@ -1052,6 +1289,11 @@ def run_ablation_experiment(
             pbar.update(1)
         
             # Periodically save results, generate plots, and flush cache
+            # Checkpoint every cache_flush_interval cases: a durability +
+            # memory safeguard (partial results survive a crash; donor_cache
+            # -- one activation tensor per trunk block per distinct donor --
+            # is bounded rather than growing for the whole run), not something
+            # that changes the science.
             if cases_processed % cache_flush_interval == 0:
                 pbar.write(f"\n{'='*60}")
                 pbar.write(f"Checkpoint at {cases_processed} cases")
@@ -1063,6 +1305,9 @@ def run_ablation_experiment(
                 pbar.write(f"Saved {len(results_df)} results to {results_path}")
             
                 # Generate plots
+                # Plotting is best-effort/non-critical: if it fails (e.g. no
+                # data yet for some window/patch_mode combo), the sweep keeps
+                # running rather than crashing over a cosmetic plot failure.
                 try:
                     from sliding_window_plotting import generate_ablation_plots, print_ablation_summary
                     print_ablation_summary(results_df)
@@ -1107,6 +1352,7 @@ def run_ablation_experiment(
 
 # Add to main entry point
 def main():
+    """CLI entry point: run the sliding-window bridge-ablation experiment sweep."""
     parser = argparse.ArgumentParser(
         description="Run ESMFold block patching experiments"
     )
@@ -1114,6 +1360,9 @@ def main():
         "--ablation_csv", type=str, default='data/single_block_patching_successes.csv',
         help="Path to successful_cases.csv"
     )
+    # NOTE: possible bug -- args.patch_modes is parsed but never read anywhere
+    # below (run_ablation_experiment doesn't take a patch_modes parameter);
+    # this flag currently has no effect.
     parser.add_argument(
         "--patch_modes",
         nargs="+",
@@ -1124,6 +1373,11 @@ def main():
         "--output_dir", type=str, default="sliding_window_ablation",
         help="Output directory (default: ./results)"
     )
+    # NOTE: possible bug -- args.save_pdbs / args.compute_helix are parsed but
+    # never passed into run_ablation_experiment (which has no such
+    # parameters); PDB saving and helix-content computation only exist on the
+    # unused run_single_block_experiment_fast path, not this sweep's actual
+    # entry point below.
     parser.add_argument(
         "--save_pdbs", action="store_true",
         help="Save PDB structures"
@@ -1136,6 +1390,8 @@ def main():
         "--device", type=str, default=None,
         help="Device to use (default: auto-detect)"
     )
+    # NOTE: possible bug -- args.skip_experiments is parsed but never checked
+    # anywhere below; there is no plots-only code path currently wired up.
     parser.add_argument(
         "--skip_experiments", action="store_true",
         help="Skip experiments and only generate plots from existing results"
@@ -1152,6 +1408,11 @@ def main():
         "--cache_flush_interval", type=int, default=20,
         help="Flush donor cache every N cases to prevent memory buildup (default: 20)"
     )
+    # NOTE: possible bug -- the actual default is [15], but the help text says
+    # "(default: 3 5 10 15)", which matches run_ablation_experiment's/
+    # run_single_ablation_experiment's own default parameter instead. A user
+    # relying on `--help` here would be misled about what runs if they don't
+    # pass --window_sizes explicitly.
     parser.add_argument(
         "--window_sizes", type=int, nargs="+", default=[15],
         help="Window sizes for sliding window ablation (default: 3 5 10 15)"
@@ -1163,6 +1424,10 @@ def main():
     # ABLATION EXPERIMENT
     # =========================================================================
     
+    # NOTE: possible bug -- args.ablation_csv always has a truthy default
+    # string, so this `or` fallback to os.path.join(args.output_dir, ...) is
+    # effectively unreachable in normal usage (only triggers if a user
+    # explicitly passes --ablation_csv "").
     ablation_csv = args.ablation_csv or os.path.join(args.output_dir, "block_patching_successes.csv")
     if not os.path.exists(ablation_csv):
         print(f"Error: No results found at {ablation_csv}")

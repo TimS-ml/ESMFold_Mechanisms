@@ -7,9 +7,10 @@ from pathlib import Path
 
 from huggingface_hub import HfApi, login
 
-REPO_ID = "kevinlu4588/ProteinFolding"
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-FOLDERS = ["data", "results"]
+REPO_ID = "kevinlu4588/ProteinFolding"  # Default HF Hub dataset repo for this project
+PROJECT_ROOT = Path(__file__).resolve().parent.parent  # scripts/ is one level below the repo root
+FOLDERS = ["data", "results"]  # Local folders synced to the Hub dataset repo
+# Glob patterns excluded from every upload (transient/cache/editor files, not real data)
 IGNORE_PATTERNS = [
     "__pycache__",
     "*.pyc",
@@ -18,11 +19,12 @@ IGNORE_PATTERNS = [
     "*.swo",
     ".ipynb_checkpoints",
 ]
-MAX_RETRIES = 5
-RETRY_DELAY = 60
+MAX_RETRIES = 5  # Max attempts per folder upload before giving up
+RETRY_DELAY = 60  # Base backoff in seconds between retries (doubled for rate-limit errors)
 
 
 def parse_args():
+    """Parse command-line arguments for the upload script."""
     parser = argparse.ArgumentParser(
         description="Upload data/ and results/ to HuggingFace Hub."
     )
@@ -46,10 +48,12 @@ def parse_args():
 
 
 def ensure_authenticated(api: HfApi, token: str | None):
+    """Ensure the HfApi client has valid credentials, prompting an interactive login if needed."""
     if token:
         api.token = token
         return
     try:
+        # whoami() succeeds silently if a cached CLI/token login already exists
         api.whoami()
         return
     except Exception:
@@ -66,7 +70,9 @@ def upload_with_retry(api: HfApi, **kwargs):
             return
         except Exception as e:
             err = str(e)
+            # 504 = gateway timeout, 429 = rate limited; both are transient and worth retrying
             if ("504" in err or "429" in err) and attempt < MAX_RETRIES:
+                # Back off twice as long for rate limiting (429) as for a plain timeout
                 delay = RETRY_DELAY * (2 if "429" in err else 1)
                 print(f"    Error (attempt {attempt}/{MAX_RETRIES}), "
                       f"retrying in {delay}s...")
@@ -82,6 +88,7 @@ def upload_folder_chunked(api: HfApi, folder_path: Path, folder_name: str,
     skip_dirs = {"__pycache__", ".ipynb_checkpoints"}
     subdirs = sorted([d for d in folder_path.iterdir()
                       if d.is_dir() and d.name not in skip_dirs])
+    # Loose top-level files (not inside any subfolder) get uploaded together in one commit
     files = [f for f in folder_path.iterdir()
              if f.is_file() and not any(f.match(p) for p in ignore_patterns)]
 
@@ -93,10 +100,12 @@ def upload_folder_chunked(api: HfApi, folder_path: Path, folder_name: str,
             path_in_repo=folder_name,
             repo_id=repo_id,
             repo_type="dataset",
-            allow_patterns=[f.name for f in files],
+            allow_patterns=[f.name for f in files],  # restrict this commit to just these files
             ignore_patterns=ignore_patterns,
         )
 
+    # Upload each subfolder as its own separate commit so a failure only requires
+    # retrying that one subfolder rather than the whole (potentially huge) folder
     for i, subdir in enumerate(subdirs, 1):
         print(f"  [{i}/{len(subdirs)}] Uploading {folder_name}/{subdir.name}/ ...")
         upload_with_retry(
@@ -110,6 +119,7 @@ def upload_folder_chunked(api: HfApi, folder_path: Path, folder_name: str,
 
 
 def main():
+    """Authenticate, create/reuse the HF dataset repo, and upload each requested folder."""
     args = parse_args()
     api = HfApi()
 
@@ -117,6 +127,7 @@ def main():
     user = api.whoami()["name"]
     print(f"Authenticated as: {user}")
 
+    # exist_ok=True makes this safe to re-run against an already-created repo
     repo_url = api.create_repo(
         repo_id=args.repo_id,
         repo_type="dataset",

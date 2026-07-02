@@ -16,6 +16,7 @@ import numpy as np
 from collections import defaultdict
 
 
+# Hardcoded absolute path from the original author's machine
 # Path to existing test set to exclude
 EXCLUDE_CSV = "/share/NFS/u/kevin/ProteinFolding-1/data_old/target_test.csv"
 
@@ -24,6 +25,8 @@ def load_exclude_sequences(csv_path):
     """Load sequences to exclude from existing test set."""
     try:
         df = pd.read_csv(csv_path)
+        # Track both exact sequences and PDB IDs so a candidate can be excluded either by
+        # being literally the same protein (same pdb_id) or by sharing its exact sequence
         sequences = set(df['sequence'].tolist())
         pdb_ids = set(df['pdb_id'].str.lower().tolist())
         print(f"  Loaded {len(sequences)} sequences to exclude from {csv_path}")
@@ -40,12 +43,13 @@ def load_from_fasta(fasta_path):
     """Load data from FASTA file."""
     records = []
     current_header = None
-    current_seq = []
+    current_seq = []  # accumulates sequence lines until the next '>' header (multi-line FASTA entries)
     
     with open(fasta_path, 'r') as f:
         for line in f:
             line = line.strip()
             if line.startswith('>'):
+                # Hit a new header line -- flush/parse the record we were accumulating so far
                 # Save previous record
                 if current_header and current_seq:
                     record = parse_fasta_header(current_header, ''.join(current_seq))
@@ -56,6 +60,7 @@ def load_from_fasta(fasta_path):
             else:
                 current_seq.append(line)
         
+        # Loop above only flushes a record when it sees the *next* '>' header
         # Don't forget last record
         if current_header and current_seq:
             record = parse_fasta_header(current_header, ''.join(current_seq))
@@ -69,6 +74,7 @@ def parse_fasta_header(header, sequence):
     """Parse FASTA header like: 1oaiA|len=59|helix=0.69|1.10.8.10"""
     parts = header.split('|')
     
+    # First token is the 4-char PDB ID + 1-char chain letter (e.g. "1oaiA" -> "1oai" + "A")
     pdb_chain = parts[0] if parts else ''
     pdb_id = pdb_chain[:4].lower() if len(pdb_chain) >= 4 else pdb_chain.lower()
     chain = pdb_chain[4].upper() if len(pdb_chain) > 4 else 'A'
@@ -77,6 +83,8 @@ def parse_fasta_header(header, sequence):
     helix_fraction = None
     cath_codes = ''
     
+    # Remaining '|'-separated tokens are key=value pairs, except the CATH code which
+    # has no '=' and is instead recognized by containing a '.' (e.g. "1.10.8.10")
     for part in parts[1:]:
         if part.startswith('len='):
             try:
@@ -110,6 +118,9 @@ def sequence_identity(seq1, seq2):
     if min_len == 0:
         return 1.0  # Treat empty as identical to be safe
     
+    # Naive position-by-position comparison (zip stops at the shorter sequence), not a
+    # real sequence alignment -- fast approximation used only for greedy diversity
+    # filtering below, not for rigorous homology detection.
     matches = sum(a == b for a, b in zip(seq1, seq2))
     return matches / min_len
 
@@ -139,6 +150,7 @@ def select_diverse_sequences(records, n_target=200, max_identity=0.25,
         if len(selected) >= n_target:
             break
         
+        # Exact match against test set
         # Check if sequence or PDB ID is in exclude set
         if candidate['sequence'] in exclude_sequences:
             excluded_count += 1
@@ -148,6 +160,7 @@ def select_diverse_sequences(records, n_target=200, max_identity=0.25,
             excluded_count += 1
             continue
         
+        # Guards against near-duplicate/homologous entries leaking from the train set into test
         # Also check similarity to excluded sequences (not just exact match)
         too_similar_to_excluded = False
         for excl_seq in exclude_sequences:
@@ -159,6 +172,8 @@ def select_diverse_sequences(records, n_target=200, max_identity=0.25,
             excluded_count += 1
             continue
         
+        # Greedy diversity: a candidate is only accepted if it's below max_identity to
+        # every sequence already chosen
         # Check identity against all selected sequences
         is_diverse = True
         for existing in selected:
@@ -180,14 +195,15 @@ def select_diverse_sequences(records, n_target=200, max_identity=0.25,
 
 
 def main():
+    """Run the full filter -> exclude -> diversify -> save pipeline for the alpha-helical train set."""
     # Configuration
-    INPUT_FASTA = "cath_all_alpha.fasta"
+    INPUT_FASTA = "cath_all_alpha.fasta"  # produced by fix_datasets_alpha_helical.py
     OUTPUT_CSV = "data/alpha_helical_train.csv"
     
-    MIN_LENGTH = 90
-    MAX_LENGTH = 400
+    MIN_LENGTH = 90  # residues; keeps small fragments out
+    MAX_LENGTH = 400  # residues; keeps runtime/memory for downstream folding tractable
     TARGET_CHAIN = 'A'
-    N_SEQUENCES = 200
+    N_SEQUENCES = 200  # desired train set size
     MAX_IDENTITY = 0.25  # 25% sequence identity threshold
     
     # Allow command line override
@@ -228,6 +244,8 @@ def main():
     print(f"\n[4] Loading sequences to exclude...")
     exclude_sequences, exclude_pdb_ids = load_exclude_sequences(EXCLUDE_CSV)
     
+    # The greedy selection below processes records in this order, so ties in diversity
+    # favor more strongly-helical proteins
     # Sort by helix fraction (prefer higher helix content)
     records.sort(key=lambda x: x['helix_fraction'] or 0, reverse=True)
     
@@ -253,6 +271,7 @@ def main():
     print(f"\n[6] Saving to {OUTPUT_CSV}...")
     df = pd.DataFrame(selected)
     
+    # Consistent, predictable schema for downstream loading
     # Reorder columns
     cols = ['pdb_id', 'chain', 'length', 'helix_fraction', 'cath_codes', 'sequence']
     df = df[cols]
@@ -272,6 +291,8 @@ def main():
         hf = df['helix_fraction'].dropna()
         print(f"  Helix fraction: {hf.min():.0%}-{hf.max():.0%} (mean: {hf.mean():.0%})")
     
+    # Brute-force all-pairs check (O(n^2), fine at n≈200) as a sanity check that the
+    # greedy selection above actually respected MAX_IDENTITY
     # Verify diversity
     print("\n  Verifying diversity...")
     sequences = df['sequence'].tolist()

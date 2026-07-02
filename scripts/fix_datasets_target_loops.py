@@ -14,11 +14,12 @@ import numpy as np
 
 
 # Input/Output paths
-INPUT_CSV = "/share/NFS/u/kevin/ProteinFolding-1/data_old/patching_dataset.csv"
+INPUT_CSV = "/share/NFS/u/kevin/ProteinFolding-1/data_old/patching_dataset.csv"  # raw per-donor patching rows
 OUTPUT_CSV = "data/target_loops_dataset.csv"
 
 
 def main():
+    """Load the per-donor patching dataset and write a deduplicated per-(target, loop) CSV."""
     print("=" * 60)
     print("DEDUPLICATING PATCHING DATASET")
     print("=" * 60)
@@ -29,6 +30,8 @@ def main():
     print(f"  Loaded {len(df)} rows")
     print(f"  Columns: {list(df.columns)}")
     
+    # Everything else (donor sequence, donor-specific results, etc.) is dropped since we
+    # only want one row per (target, loop) combination
     # Identify target-related columns (keep these)
     target_columns = [
         'target_name',
@@ -65,11 +68,14 @@ def main():
     
     if not dedup_cols:
         # Fallback: deduplicate by target_name + loop_start + loop_end
+        # (used if loop_idx isn't present -- start/end position pins down the same loop)
         dedup_cols = ['target_name', 'loop_start', 'loop_end']
         dedup_cols = [col for col in dedup_cols if col in df_targets.columns]
     
     print(f"  Deduplicating by: {dedup_cols}")
     
+    # keep='first' is safe here: donor identity was already dropped above, so which
+    # duplicate donor-row we keep doesn't matter -- only the target/loop columns remain
     df_deduped = df_targets.drop_duplicates(subset=dedup_cols, keep='first')
     print(f"  After dedup: {len(df_deduped)} rows")
     

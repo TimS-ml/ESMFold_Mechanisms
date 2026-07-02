@@ -8,12 +8,13 @@ from pathlib import Path
 
 from huggingface_hub import HfApi, login, snapshot_download
 
-REPO_ID = "kevinlu4588/ProteinFolding"
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-FOLDERS = ["data", "results"]
+REPO_ID = "kevinlu4588/ProteinFolding"  # Default HF Hub dataset repo for this project
+PROJECT_ROOT = Path(__file__).resolve().parent.parent  # scripts/ is one level below the repo root
+FOLDERS = ["data", "results"]  # Local folders synced from the Hub dataset repo
 
 
 def parse_args():
+    """Parse command-line arguments for the download script."""
     parser = argparse.ArgumentParser(
         description="Download data/, models/, and results/ from HuggingFace Hub."
     )
@@ -48,6 +49,7 @@ def ensure_authenticated(api: HfApi, token: str | None):
         api.token = token
         return
     try:
+        # whoami() succeeds silently if a cached CLI/token login already exists
         api.whoami()
         return
     except Exception:
@@ -60,21 +62,23 @@ def copy_tree(src: Path, dst: Path, force: bool) -> tuple[int, int]:
     """Recursively copy files from src to dst. Returns (copied, skipped) counts."""
     copied = 0
     skipped = 0
-    for src_file in src.rglob("*"):
+    for src_file in src.rglob("*"):  # rglob walks all nested subdirectories too
         if not src_file.is_file():
             continue
         rel = src_file.relative_to(src)
         dst_file = dst / rel
+        # Default behavior: never clobber existing local files unless --force was passed
         if dst_file.exists() and not force:
             skipped += 1
             continue
         dst_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_file, dst_file)
+        shutil.copy2(src_file, dst_file)  # copy2 preserves mtime/metadata
         copied += 1
     return copied, skipped
 
 
 def main():
+    """Authenticate, snapshot-download the requested folders, then copy them into the local repo."""
     args = parse_args()
     api = HfApi()
     ensure_authenticated(api, args.token)
@@ -85,6 +89,8 @@ def main():
     allow_patterns = [f"{folder}/**" for folder in args.folders]
 
     print(f"Downloading snapshot from {args.repo_id} ...")
+    # snapshot_download pulls matching files into HF's local cache (not directly into
+    # PROJECT_ROOT) and returns that cache path; we copy_tree() from there below.
     snapshot_path = Path(
         snapshot_download(
             repo_id=args.repo_id,

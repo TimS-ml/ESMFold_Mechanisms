@@ -32,6 +32,9 @@ import numpy as np
 from tqdm import tqdm
 
 from transformers import EsmForProteinFolding, AutoTokenizer
+# Note: categorical_lddt, compute_predicted_aligned_error, compute_tm,
+# make_atom14_masks, Rigid, and Rotation are imported below but not directly
+# used in this file (EsmFoldingTrunk and EsmForProteinFoldingOutput are used).
 from transformers.models.esm.modeling_esmfold import (
     categorical_lddt,
     EsmFoldingTrunk,
@@ -54,6 +57,7 @@ if _PROJECT_ROOT not in sys.path:
 from transformers.utils import ContextManagers
 
 from src.utils.trunk_utils import detect_hairpins
+from src.utils.model_utils import load_esmfold  # shared model+tokenizer loader (handles device/precision setup)
 
 
 # ============================================================================
@@ -76,10 +80,16 @@ class CollectedRepresentations:
     z_blocks: Dict[int, torch.Tensor] = field(default_factory=dict)  # block_idx -> [B, L, L, D_z]
     
     # Structure module IPA outputs
+    # Keyed by IPA *call order* (0..7 for the 8 structure-module blocks), not
+    # by trunk block index -- IPA is a single shared submodule invoked once
+    # per structure-module iteration, so calls are numbered as they occur.
     ipa_outputs: Dict[int, torch.Tensor] = field(default_factory=dict)  # sm_block_idx -> [B, L, D]
     
     def clear(self):
         """Clear all collected representations."""
+        # __dataclass_fields__ lists every field declared above; clearing each
+        # dict in place (instead of reassigning attributes) lets the same
+        # instance be reused across multiple runs without leaking old data.
         for attr in self.__dataclass_fields__:
             getattr(self, attr).clear()
 
@@ -87,6 +97,11 @@ class CollectedRepresentations:
 # ============================================================================
 # PART 2: HOOK MANAGERS (collection only, no forward patching)
 # ============================================================================
+# Note: these classes are local, self-contained equivalents of the ones in
+# src/utils/representation_utils.py (which block_patching.py imports instead).
+# They're duplicated here so this script has no cross-file dependency for its
+# core collection logic; the module_patching.py copies are a simpler subset
+# (e.g. no seq2pair/pair2seq collection).
 
 class ESMEncoderHooks:
     """
@@ -102,20 +117,37 @@ class ESMEncoderHooks:
     """
     
     def __init__(self, esm_module: nn.Module, collector: CollectedRepresentations):
+        """Store the target ESM module and shared collector; handle list starts empty."""
         self.esm = esm_module
         self.collector = collector
+        # register_forward_hook() returns a RemovableHandle; we must keep it to
+        # be able to unregister the hook later (torch doesn't track this for us).
         self.handles: List = []
     
     def register(self, layers: Any = 'all'):
         """Register hooks on ESM encoder layers."""
         if layers == 'all':
+            # self.esm.encoder.layer is the ModuleList of 36 ESM-2 transformer
+            # layers (indices 0..35).
             layers = range(len(self.esm.encoder.layer))
         
         for idx in layers:
+            # A forward hook fires right after the module's forward() returns,
+            # letting us read (or, elsewhere in this file, replace) activations
+            # without touching the model's own forward-pass code.
+            # make_hook(layer_idx) exists to dodge a classic closure late-binding
+            # bug: hooks only *run* later, during the actual forward pass, after
+            # this whole registration loop has finished. If `hook` closed over
+            # the loop variable `idx` directly, every layer's hook would share
+            # the same `idx` cell and all read its final value at call time.
+            # Passing `idx` as an argument freezes its current value into a
+            # fresh `layer_idx` binding per iteration.
             def make_hook(layer_idx):
                 def hook(module, inputs, outputs):
                     # ESM layer outputs hidden states (possibly as tuple)
                     tensor = outputs[0] if isinstance(outputs, tuple) else outputs
+                    # detach(): drop autograd graph (values only, no grad needed);
+                    # cpu(): free GPU memory since we may collect all 36 layers.
                     self.collector.esm_layers[layer_idx] = tensor.detach().cpu()
                 return hook
             
@@ -124,15 +156,23 @@ class ESMEncoderHooks:
     
     def remove(self):
         """Remove all registered hooks."""
+        # RemovableHandle.remove() unregisters from the module so the hook
+        # stops firing on future forward passes; clearing self.handles keeps
+        # bookkeeping consistent and makes remove() safe to call more than once.
         for h in self.handles:
             h.remove()
         self.handles.clear()
     
     def __enter__(self):
+        """Enter the context manager: register hooks, then return self."""
         self.register()
         return self
     
     def __exit__(self, *args):
+        """Exit the context manager: remove all hooks regardless of how the block exited."""
+        # Called on normal exit AND on exception (args = exc_type/exc_val/exc_tb,
+        # ignored here), so hooks are always cleaned up and never leak into a
+        # later, unrelated forward pass.
         self.remove()
 
 
@@ -150,6 +190,7 @@ class TrunkHooks:
     """
     
     def __init__(self, trunk: nn.Module, collector: CollectedRepresentations):
+        """Store the target trunk module and shared collector; handle list starts empty."""
         self.trunk = trunk
         self.collector = collector
         self.handles: List = []
@@ -162,11 +203,17 @@ class TrunkHooks:
     ):
         """Register hooks on trunk blocks."""
         if blocks == 'all':
+            # self.trunk.blocks is the ModuleList of 48 triangular self-attention
+            # blocks that make up the folding trunk.
             blocks = range(len(self.trunk.blocks))
         
         for idx in blocks:
             block = self.trunk.blocks[idx]
             
+            # Each trunk block's forward() always returns a plain (s, z) tuple
+            # (unlike the ESM layers above, no isinstance check is needed).
+            # block_idx is captured via this factory for the same late-binding
+            # reason explained in ESMEncoderHooks.register() above.
             def make_hook(block_idx, do_s, do_z):
                 def hook(module, inputs, outputs):
                     s, z = outputs
@@ -181,15 +228,19 @@ class TrunkHooks:
     
     def remove(self):
         """Remove all registered hooks."""
+        # Same lifecycle as ESMEncoderHooks.remove(): unregister every handle,
+        # then clear the list so bookkeeping matches reality.
         for h in self.handles:
             h.remove()
         self.handles.clear()
     
     def __enter__(self):
+        """Enter the context manager: register hooks, then return self."""
         self.register()
         return self
     
     def __exit__(self, *args):
+        """Exit the context manager: remove all hooks regardless of how the block exited."""
         self.remove()
 
 
@@ -211,14 +262,22 @@ class IPAHooks:
     """
     
     def __init__(self, structure_module: nn.Module, collector: CollectedRepresentations):
+        """Store the target structure module and shared collector; handles/counter start empty/zero."""
         self.sm = structure_module
         self.collector = collector
         self.handles: List = []
+        # Unlike ESMEncoderHooks/TrunkHooks (one hook per submodule instance, so
+        # the index is fixed at registration time), there is only *one* `ipa`
+        # submodule and its forward() is called 8 times per structure-module
+        # forward pass (once per structure-module block). A single hook fires
+        # on every one of those calls, so we track call order ourselves.
         self._call_idx = 0
     
     def register(self):
         """Register hook on IPA module."""
         def hook(module, inputs, outputs):
+            # outputs is a single tensor (not a tuple), keyed by call order
+            # rather than a true block index (see _call_idx comment above).
             self.collector.ipa_outputs[self._call_idx] = outputs.detach().cpu()
             self._call_idx += 1
         
@@ -227,10 +286,19 @@ class IPAHooks:
     
     def reset(self):
         """Reset call counter. Call before each forward pass."""
+        # _call_idx persists across forward passes; without resetting, a
+        # second forward pass would keep counting up from 8 instead of
+        # restarting at 0, so ipa_outputs would grow instead of being
+        # overwritten with each new forward pass's 8 fresh values.
         self._call_idx = 0
     
     def remove(self):
         """Remove all registered hooks."""
+        # NOTE: possible bug -- unlike ESMEncoderHooks/TrunkHooks, this class
+        # defines no __enter__/__exit__, so it can't be used as a `with`
+        # context manager despite having the same register()/remove() API;
+        # likely just an oversight (must call register()/reset()/remove()
+        # manually, as shown in the class docstring's usage example).
         for h in self.handles:
             h.remove()
         self.handles.clear()
@@ -273,6 +341,8 @@ def run_and_collect(
         (model_outputs, collected_representations)
     """
     collector = CollectedRepresentations()
+    # Track every hook manager we start so they can all be torn down together
+    # below, regardless of which combination of collect_* flags was requested.
     hook_managers = []
     
     # Set up hooks
@@ -293,12 +363,25 @@ def run_and_collect(
         hook_managers.append(ipa_hooks)
     
     # Run model
+    # try/finally (rather than nesting each manager in a `with`) is used
+    # because IPAHooks has no __enter__/__exit__ (see NOTE above) and because
+    # the set of active managers is dynamic (depends on the collect_* flags),
+    # so a single loop here removes whichever hooks were actually registered.
     try:
         with torch.no_grad():
+            # add_special_tokens=False: the tokenizer's own CLS/EOS are omitted
+            # so token positions line up 1:1 with residue indices for the
+            # trunk's mask/residx. Note this is independent of the ESM
+            # sub-model's *internal* BOS/EOS handling -- ESMFold's own
+            # compute_language_model_representations() prepends a BOS token
+            # before calling model.esm internally, which is why hook-captured
+            # ESM hidden states are offset by +1 relative to residue index
+            # (see patch_esm_layers below).
             inputs = tokenizer(sequence, return_tensors='pt', add_special_tokens=False).to(device)
             outputs = model(**inputs, num_recycles=num_recycles)
     finally:
         # Always clean up hooks
+        # (runs even if the forward pass above raised, since this is `finally`)
         for mgr in hook_managers:
             mgr.remove()
     
@@ -339,6 +422,8 @@ def create_pairwise_mask(
         
     elif mode in ("touch", "hole"):
         # Compute how far we can extend based on donor/target boundaries
+        # (the smaller of the donor-side and target-side room available, so
+        # the coordinate mapping back to the donor below always stays valid).
         left_extent = min(donor_start, target_start)
         right_extent = min(donor_len - donor_end, target_len - target_end)
         
@@ -346,11 +431,19 @@ def create_pairwise_mask(
         transport_end = target_end + right_extent
         
         # Create cross pattern
+        # ("+" shape: rows = core patch region x cols = extended window,
+        # unioned with its transpose. Selects every (i, j) pair where i or j
+        # falls in the core region and the other spans the flanking context --
+        # i.e. interactions between the patched residues and their
+        # surrounding context, not just interactions within the patch itself.)
         mask[target_start:target_end, transport_start:transport_end] = True
         mask[transport_start:transport_end, target_start:target_end] = True
         
         if mode == "hole":
             # Remove intra-hairpin region
+            # ("hole" = the same cross minus the "intra" square, isolating just
+            # the core-to-context pairs; core-to-core pairs are what "intra"
+            # mode covers on its own.)
             mask[target_start:target_end, target_start:target_end] = False
     
     return mask
@@ -384,16 +477,30 @@ def patch_esm_layers(
     handles = []
     
     for layer_idx, donor_tensor in donor_layers.items():
+        # Defensive guard: skip any collected layer index that doesn't exist
+        # on this model (e.g. a stale/mismatched donor_layers dict).
         if layer_idx >= len(model.esm.encoder.layer):
             continue
         
+        # Closure factory to freeze this iteration's (donor, t_start, t_end)
+        # values -- same late-binding concern as the collection hooks above.
         def make_patch_hook(donor, t_start, t_end):
             def hook(module, inputs, outputs):
                 tensor = outputs[0] if isinstance(outputs, tuple) else outputs
+                # Clone before mutating: PyTorch forward hooks replace the
+                # module's output with whatever this function returns, so we
+                # build a modified copy rather than editing the live tensor
+                # (which downstream code / autograd may still reference).
                 patched = tensor.clone()
+                # Match device/dtype in case the donor tensor (collected
+                # elsewhere, possibly at a different precision -- see
+                # src/utils/model_utils.py's mixed-precision ESM backbone) and
+                # the acceptor's live tensor don't already agree.
                 d = donor.to(patched.device, patched.dtype)
                 # +1 for BOS token in ESM
                 patched[:, t_start + 1:t_end + 1, :] = d
+                # Preserve the original output "shape" (bare tensor vs. tuple)
+                # so downstream code that unpacks the module's output still works.
                 if isinstance(outputs, tuple):
                     return (patched,) + outputs[1:]
                 return patched
@@ -404,8 +511,13 @@ def patch_esm_layers(
         handles.append(handle)
     
     try:
+        # Code before yield = the context manager's "enter" (hooks are already
+        # registered above by the time the `with` block's body starts running).
         yield
     finally:
+        # Code after yield = the "exit": always remove the patch hooks when the
+        # `with` block ends, whether it exits normally or via an exception, so
+        # the acceptor model doesn't stay silently patched for later calls.
         for h in handles:
             h.remove()
 
@@ -441,18 +553,32 @@ def make_trunk_all_block_patch_forward(
         A forward function to be bound to model.trunk
     """
     
+    # NOTE: this whole `forward` is a copy of the original
+    # EsmFoldingTrunk.forward (transformers.models.esm.modeling_esmfold), with
+    # a single addition: `apply_patch(...)` is called after every block inside
+    # `trunk_iter`. Everything else (recycling loop, structure module calls,
+    # distogram bins) is reproduced as-is so the patched run stays numerically
+    # identical to a normal forward pass except at the patched positions.
     def forward(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
+        # seq_feats: [B, L, c_s] sequence repr; pair_feats: [B, L, L, c_z]
+        # pairwise repr -- these are the trunk's inputs *before* any blocks run.
         device = seq_feats.device
         s_s_0, s_z_0 = seq_feats, pair_feats
 
         if no_recycles is None:
             no_recycles = self.config.max_recycles
         else:
+            # First "recycle" is just the standard forward pass through the
+            # model, so the requested recycle count needs +1 total iterations.
             no_recycles += 1
 
         def apply_patch(block_idx, s, z):
             """Apply donor patch at this block."""
             # Patch sequence
+            # (overwrites the acceptor's [target_start:target_end] span of s,
+            # shape [B, patch_len, c_s], with the donor's s at the same trunk
+            # block index -- requires the donor hairpin region and target
+            # patch region to be the same length.)
             if patch_mode in ('both', 'sequence') and block_idx in donor_s_blocks:
                 donor_s = donor_s_blocks[block_idx].to(s.device, dtype=s.dtype)
                 s[:, target_start:target_end, :] = donor_s
@@ -463,30 +589,53 @@ def make_trunk_all_block_patch_forward(
                 mask_dev = pairwise_mask.to(z.device)
                 
                 # Apply via mask - map target coords to donor coords
+                # pairwise_mask is defined over the *target's* full [L, L]
+                # coordinate space (see create_pairwise_mask); torch.where
+                # turns it into explicit (ti, tj) index pairs to patch.
                 indices = torch.where(mask_dev)
                 for i in range(len(indices[0])):
                     ti, tj = indices[0][i].item(), indices[1][i].item()
+                    # Shift each target coordinate by the same offset that
+                    # maps target_start -> donor_start, translating this (i, j)
+                    # position in the target into the corresponding position
+                    # in the donor's (full, unsliced) z tensor.
                     di = ti - target_start + donor_start
                     dj = tj - target_start + donor_start
+                    # Only copy if the mapped donor coordinates are actually
+                    # in-bounds (the mask's flanking "touch"/"hole" extent is
+                    # bounded by target_len, but donor_len may differ).
                     if 0 <= di < donor_z.shape[1] and 0 <= dj < donor_z.shape[2]:
                         z[:, ti, tj, :] = donor_z[:, di, dj, :]
             
             return s, z
 
         def trunk_iter(s, z, residx, mask):
+            # Relative-position bias added to the pairwise repr once per
+            # recycle iteration, before any blocks run.
             z = z + self.pairwise_positional_embedding(residx, mask=mask)
             for block_idx, block in enumerate(self.blocks):
                 s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
+                # This is the actual intervention point: splice in the donor's
+                # captured activations immediately after each block computes
+                # its own output, before the next block consumes it.
                 s, z = apply_patch(block_idx, s, z)
             return s, z
 
         # Standard recycle loop
+        # (unmodified from the original trunk forward: ESMFold refines s/z
+        # over several passes ("recycles") -- each pass's final s/z and a
+        # coarse distance histogram of the predicted structure are fed back in
+        # as an additive correction to the *next* pass's initial s_s_0/s_z_0,
+        # allowing structure predictions to improve iteratively.)
         s_s, s_z = s_s_0, s_z_0
         recycle_s = torch.zeros_like(s_s)
         recycle_z = torch.zeros_like(s_z)
         recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
 
         for recycle_idx in range(no_recycles):
+            # Only the final recycle iteration needs gradients (earlier ones
+            # only feed forward-computed values into the next iteration), so
+            # torch.no_grad() is used on all but the last to save memory/compute.
             with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
                 recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
                 recycle_z = self.recycle_z_norm(recycle_z.detach()).to(device)
@@ -500,6 +649,10 @@ def make_trunk_all_block_patch_forward(
                 )
 
                 recycle_s, recycle_z = s_s, s_z
+                # Bin this iteration's predicted CB-CB distances (in Angstroms,
+                # 3.375-21.375 A range, self.recycle_bins=15 bins) into a coarse
+                # distogram fed back into recycle_z above on the next iteration
+                # -- gives the next pass a summary of the current 3D guess.
                 recycle_bins = EsmFoldingTrunk.distogram(
                     structure["positions"][-1][:, :, :3],
                     3.375, 21.375, self.recycle_bins,
@@ -530,6 +683,11 @@ def patch_trunk_all_blocks(
         with patch_trunk_all_blocks(model, donor_s, donor_z, ...):
             outputs = model(**inputs)
     """
+    # Unlike the hook-based ESM/IPA patching above, the trunk can't be patched
+    # with a plain forward hook because the intervention needs to happen
+    # *between* blocks, inside the trunk's own recycling loop -- so instead we
+    # temporarily replace model.trunk's bound forward method with our patched
+    # version built above.
     original = model.trunk.forward
     
     patched_forward = make_trunk_all_block_patch_forward(
@@ -537,11 +695,18 @@ def patch_trunk_all_blocks(
         target_start, target_end, donor_start,
         pairwise_mask, patch_mode,
     )
+    # types.MethodType binds the plain `forward` function as a proper bound
+    # method of this specific model.trunk instance (so `self` inside it
+    # resolves correctly), overriding the instance's forward for as long as
+    # this context manager is active.
     model.trunk.forward = types.MethodType(patched_forward, model.trunk)
     
     try:
+        # Enter: forward is already monkey-patched by this point.
         yield
     finally:
+        # Exit (normal or exception): always restore the original forward so
+        # the model behaves normally again after the `with` block.
         model.trunk.forward = original
 
 
@@ -568,17 +733,30 @@ def patch_ipa_outputs(
     """
     handles = []
     call_counter = [0]  # Use list for mutability in closure
+    # (a single-element list acts as a mutable "box" the nested hook() below
+    # can increment without needing a `nonlocal` declaration)
     
     def make_patch_hook():
         def hook(module, inputs, outputs):
+            # Same call-order-as-key trick as IPAHooks: the IPA submodule is
+            # invoked once per structure-module block (8x per forward pass),
+            # so call order stands in for a block index. This lines up with
+            # how donor_ipa was captured (via IPAHooks during donor collection),
+            # since both donor and acceptor forward passes call IPA the same
+            # number of times in the same order.
             idx = call_counter[0]
             call_counter[0] += 1
             
             if idx in donor_ipa:
+                # Clone + slice-assign + return: forward hooks replace the
+                # module's output with whatever is returned, so we build a
+                # patched copy rather than mutating the live tensor in place.
                 patched = outputs.clone()
                 donor = donor_ipa[idx].to(patched.device, patched.dtype)
                 patched[:, target_start:target_end, :] = donor
                 return patched
+            # No donor value for this call index -- leave this call's output
+            # unpatched (equivalent to returning None, but explicit).
             return outputs
         return hook
     
@@ -588,6 +766,8 @@ def patch_ipa_outputs(
     try:
         yield
     finally:
+        # Always remove the hook so later, unrelated forward passes aren't
+        # silently patched too.
         for h in handles:
             h.remove()
 
@@ -612,9 +792,13 @@ def evaluate_hairpin(
         - ptm: float or None
     """
     # Check for hairpin using trunk_utils
+    # (the second return value, a list of hairpin coordinate tuples, is
+    # discarded here -- only presence/absence is needed for this metric)
     hairpin_found, _ = detect_hairpins(outputs, model)
     
     # Structure quality metrics
+    # outputs.plddt: [B, L] per-residue confidence in [0, 1] (higher = more
+    # confident); [0] indexes the single-sequence batch dim.
     plddt = outputs.plddt[0].cpu().numpy()
     ptm = outputs.ptm.item() if outputs.ptm is not None else None
     
@@ -632,6 +816,9 @@ def compute_alpha_helix_content(pdb_string: str) -> Tuple[Optional[int], Optiona
     from Bio import PDB
     from Bio.PDB import DSSP
     
+    # delete=False: the file must still exist on disk after this `with` block
+    # closes it, because DSSP shells out to the external `mkdssp` binary, which
+    # re-reads the PDB from its path rather than from memory.
     with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode='w') as f:
         f.write(pdb_string)
         pdb_path = f.name
@@ -651,6 +838,8 @@ def compute_alpha_helix_content(pdb_string: str) -> Tuple[Optional[int], Optiona
             return None, None, None
         
         total_residues = len(dssp)
+        # DSSP codes H/I/G are the three helix flavors (alpha-, pi-, and
+        # 3-10-helix respectively); together they define "helical" here.
         helix_residues = sum(1 for k in dssp.keys() if dssp[k][2] in ["H", "I", "G"])
         helix_percentage = (helix_residues / total_residues * 100) if total_residues > 0 else 0
         
@@ -660,6 +849,9 @@ def compute_alpha_helix_content(pdb_string: str) -> Tuple[Optional[int], Optiona
         print(f"Helix content computation failed: {e}")
         return None, None, None
     finally:
+        # Best-effort temp file cleanup; bare except so a failure to delete
+        # (e.g. already removed, permissions) doesn't mask the real result
+        # computed above.
         try:
             os.unlink(pdb_path)
         except:
@@ -677,6 +869,10 @@ def generate_summary_plots(results_df: pd.DataFrame, output_dir: str):
     from pathlib import Path
     
     # Import plotting functions from your module
+    # Bare `module_plotting` (not `src.module_plotting`) only resolves if the
+    # script's own directory happens to be on sys.path; wrapped in try/except
+    # so an unresolvable import doesn't crash the whole (potentially
+    # long-running) experiment -- it just skips plot generation for this flush.
     try:
         from module_plotting import (
             plot_success_rates,
@@ -739,12 +935,7 @@ def run_experiment_on_dataset(
     print(f"Using device: {device}")
     
     # Load model
-    print("Loading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
-    model = model.to(device)
-    model.eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
-    print("Model loaded")
+    model, tokenizer = load_esmfold(device)
     
     # Load dataset
     print(f"Loading patching dataset from {csv_path}...")
@@ -758,6 +949,8 @@ def run_experiment_on_dataset(
     results_path = os.path.join(output_dir, "all_block_patching_results.parquet")
     
     # Columns to preserve from input
+    # (carried through into every result row so each experiment result stays
+    # traceable back to its source case)
     preserve_cols = [
         "target_name", "target_sequence", "target_length",
         "loop_idx", "loop_start", "loop_end", "loop_length", "loop_sequence",
@@ -770,10 +963,15 @@ def run_experiment_on_dataset(
         "donor_handedness_magnitude", "loop_similarity",
     ]
     
+    # df.iterrows() yields (index, Series) pairs so columns can be accessed by
+    # name (row["..."]) below; total=len(df) is passed explicitly to tqdm since
+    # the iterrows() generator itself has no __len__ for the progress bar to use.
     for case_idx, row in tqdm(df.iterrows(), total=len(df), desc="Cases"):
         target_seq = row["target_sequence"]
         donor_seq = row["donor_sequence"]
         
+        # Half-open [start, end) regions: where to splice in the acceptor
+        # (target) and where to read from in the donor.
         target_start = int(row["target_patch_start"])
         target_end = int(row["target_patch_end"])
         donor_start = int(row["donor_hairpin_start"])
@@ -784,6 +982,8 @@ def run_experiment_on_dataset(
         print(f"  Donor hairpin: [{donor_start}:{donor_end})")
         
         # Preserve metadata
+        # (guarded by `if col in row.index` so this still works against input
+        # CSVs that are missing an optional column)
         case_meta = {col: row[col] for col in preserve_cols if col in row.index}
         case_meta["case_idx"] = case_idx
         case_meta["target_start"] = target_start
@@ -795,6 +995,10 @@ def run_experiment_on_dataset(
         # COLLECT DONOR REPRESENTATIONS (using hooks!)
         # =====================================================================
         print("  Collecting donor representations...")
+        # collect_ipa=True is requested unconditionally here (even though the
+        # "structure_module" patch_module case may be skipped for this run)
+        # since donor collection happens once per case up front, before we
+        # know which patch_modules the caller wants to actually run below.
         donor_outputs, donor_collected = run_and_collect(
             model, tokenizer, device, donor_seq,
             collect_esm=True,
@@ -805,6 +1009,11 @@ def run_experiment_on_dataset(
         )
         
         # Extract hairpin region for sequence-like representations
+        # (slices each [B, L, D] tensor down to just [B, donor_end-donor_start,
+        # D], which is spliced directly into the target's
+        # [target_start:target_end] span elsewhere -- this assumes the two
+        # regions are equal length, guaranteed by how the patching dataset's
+        # donor/target regions were constructed, not re-validated here.)
         donor_esm_region = {
             k: v[:, donor_start:donor_end, :] 
             for k, v in donor_collected.esm_layers.items()
@@ -825,6 +1034,10 @@ def run_experiment_on_dataset(
         print(f"    Trunk blocks (z): {len(donor_z_full)}")
         print(f"    IPA outputs: {len(donor_ipa_region)}")
         
+        # donor_outputs (the donor's full structure prediction) is no longer
+        # needed now that its intermediate representations have been
+        # extracted; freeing it (and the CUDA allocator cache) here keeps GPU
+        # memory available for the many acceptor forward passes run below.
         del donor_outputs
         torch.cuda.empty_cache()
         
@@ -857,6 +1070,14 @@ def run_experiment_on_dataset(
         # =====================================================================
         # INPUT INTERVENTION BASELINE
         # =====================================================================
+        # Baseline/positive-control comparison: this literally splices the
+        # donor's hairpin AMINO ACIDS into the target's SEQUENCE STRING (an
+        # "input-level" intervention), then runs it through the unmodified
+        # model -- as opposed to the activation-patching experiments below,
+        # which keep the target's original sequence and instead splice
+        # internal representations mid-forward-pass. Comparing the two shows
+        # whether the causal information found via activation patching
+        # matches what a full ground-truth sequence substitution would give.
         if "literal_patched_sequence" in row.index and pd.notna(row["literal_patched_sequence"]):
             literal_seq = row["literal_patched_sequence"]
             
@@ -941,6 +1162,11 @@ def run_experiment_on_dataset(
                 for patch_mode in patch_modes:
                     for mask_mode in patch_mask_modes:
                         # Skip redundant mask modes for sequence-only patching
+                        # (pairwise_mask only affects z (pairwise) patching, so
+                        # varying mask_mode has no effect when patch_mode ==
+                        # "sequence" -- run it once, using the first mask mode
+                        # as a placeholder label, instead of duplicating
+                        # identical results under every mask_mode.)
                         if patch_mode == "sequence" and mask_mode != patch_mask_modes[0]:
                             continue
                         
@@ -1023,6 +1249,13 @@ def run_experiment_on_dataset(
         all_results.extend(case_results)
         
         # Flush results and regenerate plots every flush_every cases
+        # (this is a long-running experiment -- many cases x many patch
+        # variants x forward passes -- so periodically persisting progress
+        # means a crash/OOM/kill partway through doesn't lose everything, and
+        # progress can be monitored via the regenerated plots without waiting
+        # for the full run to finish. `case_idx + 1` assumes case_idx behaves
+        # as a 0-based positional counter, which holds here since df comes
+        # from a fresh pd.read_csv() with the default RangeIndex.)
         cases_completed = case_idx + 1
         if cases_completed % flush_every == 0 or cases_completed == len(df):
             print(f"\n  Flushing results ({cases_completed} cases completed)...")
@@ -1031,6 +1264,7 @@ def run_experiment_on_dataset(
             generate_summary_plots(interim_df, output_dir)
         
         # Clean up
+        # (this case's donor tensors, before moving on to the next case)
         del donor_collected, donor_esm_region, donor_s_region, donor_z_full, donor_ipa_region
         torch.cuda.empty_cache()
     
@@ -1043,6 +1277,9 @@ def run_experiment_on_dataset(
     print(f"Results saved to {results_path}")
     print(f"Total experiments: {len(results_df)}")
     print(f"\nHairpin detection rate by patch_module:")
+    # hairpin_found is boolean, so groupby(...).mean() over it computes the
+    # fraction of True values per group -- i.e. the hairpin-formation success
+    # rate for each patch_module.
     print(results_df.groupby("patch_module")["hairpin_found"].mean())
     print(f"\nHairpin detection rate by patch_module × patch_mode:")
     print(results_df.groupby(["patch_module", "patch_mode"])["hairpin_found"].mean())
@@ -1095,6 +1332,12 @@ def main():
         help="Device"
     )
     parser.add_argument(
+        # Note: this CLI default (4) differs from run_experiment_on_dataset's
+        # own parameter default (20); since main() always passes
+        # flush_every=args.flush_every explicitly, this is the value actually
+        # used when running as a script -- the function's default of 20 only
+        # applies if run_experiment_on_dataset() is imported and called
+        # directly without specifying flush_every.
         "--flush_every", type=int, default=4,
         help="Save results and regenerate plots every N cases"
     )

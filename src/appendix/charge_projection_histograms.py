@@ -23,19 +23,22 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # src/appendix/ -> src/ -> repo root
 if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+    sys.path.insert(0, _PROJECT_ROOT)  # ensure `src...` absolute imports below resolve when this script is run directly (not as `python -m`)
 
+# Reuse the representation-collection / charge-labeling / direction-loading helpers from the
+# DoM training script instead of redefining them here.
 from src.charge_dom_training import (
     load_directions,
     collect_representations_for_sequence,
     compute_charge_labels,
     AA_TO_IDX,
 )
+from src.utils.model_utils import load_esmfold  # shared ESMFold + tokenizer loader
 
 import warnings
-warnings.filterwarnings("ignore", message=".*mmCIF.*")
+warnings.filterwarnings("ignore", message=".*mmCIF.*")  # suppress noisy mmCIF-parsing warnings unrelated to this analysis
 
 
 BLOCKS_TO_PLOT = list(range(0, 48, 4))  # [0, 4, 8, ..., 44]
@@ -51,7 +54,7 @@ def collect_projections(directions, sequences, model, tokenizer, device, blocks)
 
     for seq in tqdm(sequences, desc="Collecting projections"):
         if not all(aa in AA_TO_IDX for aa in seq):
-            continue
+            continue  # skip sequences containing non-standard residue codes (e.g. X, B, Z, U)
         try:
             data = collect_representations_for_sequence(model, seq, tokenizer, device)
         except Exception:
@@ -61,9 +64,10 @@ def collect_projections(directions, sequences, model, tokenizer, device, blocks)
         for block in blocks:
             if block not in directions.s_directions:
                 continue
-            s = data['s_list'][block][0].numpy()
-            s_dir = directions.s_directions[block]
+            s = data['s_list'][block][0].numpy()  # (1, L, C) -> (L, C): drop the batch dim
+            s_dir = directions.s_directions[block]  # normalized DoM charge direction for this block
             for i, charge in enumerate(charges):
+                # Scalar projection of residue i's sequence representation onto the charge direction
                 proj = float(np.dot(s[i], s_dir))
                 if charge > 0:
                     projections[block]['positive'].append(proj)
@@ -73,7 +77,7 @@ def collect_projections(directions, sequences, model, tokenizer, device, blocks)
                     projections[block]['neutral'].append(proj)
 
         del data
-        torch.cuda.empty_cache()
+        torch.cuda.empty_cache()  # free GPU memory promptly; this loop runs once per sequence over potentially many sequences
 
     return projections
 
@@ -84,18 +88,25 @@ def _plot_block(ax, projections, block, show_legend=False):
     neg = np.array(projections[block]['negative'])
     neu = np.array(projections[block]['neutral'])
 
+    # Center all three groups by the SAME overall mean (not each group's own mean), so the
+    # plotted offset between groups reflects their actual separation rather than being hidden
+    # by independently re-centering each distribution.
     all_projs = np.concatenate([pos, neg, neu])
     center = all_projs.mean()
     pos_c, neg_c, neu_c = pos - center, neg - center, neu - center
 
+    # Shared bin edges (50 bins) across all three histograms so they sit on a directly comparable x-axis scale
     lo = min(pos_c.min(), neg_c.min(), neu_c.min())
     hi = max(pos_c.max(), neg_c.max(), neu_c.max())
     bins = np.linspace(lo, hi, 50)
 
+    # Neutral drawn more transparent (0.30) than positive/negative (0.55) since it's background
+    # context for the pos-vs-neg separation being illustrated
     ax.hist(neg_c, bins=bins, alpha=0.55, color=NEG_COLOR, density=True, label='Negative')
     ax.hist(neu_c, bins=bins, alpha=0.30, color=NEU_COLOR, density=True, label='Neutral')
     ax.hist(pos_c, bins=bins, alpha=0.55, color=POS_COLOR, density=True, label='Positive')
 
+    # Mark each group's (centered) mean, plus the shared center (0), for reference
     ax.axvline(x=neg_c.mean(), color=NEG_COLOR, linewidth=1.5)
     ax.axvline(x=pos_c.mean(), color=POS_COLOR, linewidth=1.5)
     ax.axvline(x=0, color='gray', linestyle='--', alpha=0.4)
@@ -120,11 +131,11 @@ def plot_single_block(projections, block, output_dir):
 
 def plot_grid(projections, blocks, output_dir):
     """Save a 3x4 grid of all block histograms."""
-    n_rows, n_cols = 3, 4
+    n_rows, n_cols = 3, 4  # 3x4 = 12, matching len(BLOCKS_TO_PLOT) (every 4th block from 0 to 44)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(22, 13))
 
     for idx, block in enumerate(blocks):
-        row, col = divmod(idx, n_cols)
+        row, col = divmod(idx, n_cols)  # convert flat index -> (row, col) grid position
         ax = axes[row, col]
         _plot_block(ax, projections, block, show_legend=(idx == 0))
 
@@ -135,6 +146,7 @@ def plot_grid(projections, blocks, output_dir):
 
 
 def parse_args():
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description='Plot charge DoM projection histograms for every 4th block',
     )
@@ -151,6 +163,7 @@ def parse_args():
 
 
 def main():
+    """Load directions + test sequences, collect projections, and save individual/grid histogram plots."""
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
 
@@ -163,18 +176,17 @@ def main():
     print(f"  Directions for {len(directions.s_directions)} blocks")
 
     # Load model
-    print("Loading ESMFold model...")
-    from transformers import EsmForProteinFolding, AutoTokenizer
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    model, tokenizer = load_esmfold(device)
 
     # Load test sequences
     print(f"Loading probing dataset from {args.probing_dataset}...")
     probing_df = pd.read_csv(args.probing_dataset)
+    # Use only the held-out test split, so the histograms reflect generalization to sequences
+    # the charge directions were NOT fit on (directions are trained elsewhere on the train split).
     test_df = probing_df[probing_df['split'] == 'test']
-    seq_col = 'FullChainSequence' if 'FullChainSequence' in test_df.columns else 'sequence'
+    seq_col = 'FullChainSequence' if 'FullChainSequence' in test_df.columns else 'sequence'  # handle either column-naming convention
     test_seqs = test_df[seq_col].tolist()
-    test_seqs = [s for s in test_seqs if all(aa in AA_TO_IDX for aa in s)]
+    test_seqs = [s for s in test_seqs if all(aa in AA_TO_IDX for aa in s)]  # drop sequences with non-standard residue codes
 
     if args.n_seqs is not None:
         test_seqs = test_seqs[:args.n_seqs]
@@ -186,7 +198,7 @@ def main():
         directions, test_seqs, model, tokenizer, device, blocks,
     )
 
-    # Save raw projections
+    # Save raw projections (so replotting/further analysis doesn't require rerunning the forward passes)
     proj_path = os.path.join(args.output, 'projections.pt')
     torch.save(projections, proj_path)
     print(f"Saved projections to {proj_path}")

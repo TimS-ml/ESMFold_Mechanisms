@@ -28,8 +28,8 @@ CIF_DIR = "./cif_files"
 CATH_FILE = "cath-domain-list.txt"
 
 # Filters
-MIN_LENGTH = 50
-MAX_LENGTH = 400
+MIN_LENGTH = 50  # residues
+MAX_LENGTH = 400  # residues
 VERIFY_WITH_DSSP = True  # Set False to skip DSSP verification (faster but less strict)
 MAX_PROTEINS = None  # Stop after collecting this many proteins
 
@@ -40,8 +40,10 @@ os.makedirs(CIF_DIR, exist_ok=True)
 # ============================================================
 def download_cath():
     """Download CATH domain list."""
+    # Official CATH classification database's "latest-release" domain list endpoint
     url = "http://download.cathdb.info/cath/releases/latest-release/cath-classification-data/cath-domain-list.txt"
     
+    # Skip re-downloading if we already have a local copy from a previous run
     if os.path.exists(CATH_FILE):
         print(f"Using existing: {CATH_FILE}")
         return
@@ -85,12 +87,14 @@ def parse_cath_class1():
             cath_topol = parts[3]     # Topology  
             cath_homol = parts[4]     # Homologous superfamily
             domain_length = parts[10] # Length
-            resolution = parts[11] if len(parts) > 11 else None
+            resolution = parts[11] if len(parts) > 11 else None  # field may be absent on some lines
             
+            # This is the whole point of this script -- skip everything that isn't Class 1
             # Class 1 = Mainly Alpha
             if cath_class != '1':
                 continue
             
+            # domain_id encodes pdb_id (4 chars) + chain (1 char) + domain number (rest)
             pdb_id = domain_id[:4].lower()
             chain = domain_id[4]
             domain_num = domain_id[5:]
@@ -104,7 +108,7 @@ def parse_cath_class1():
                 length = None
             
             try:
-                res = float(resolution) if resolution else None
+                res = float(resolution) if resolution else None  # 999.000 conventionally means NMR (no resolution)
             except:
                 res = None
             
@@ -146,12 +150,15 @@ def extract_sequence(pdb_id, chain, cif_dir, pdbl, parser, verify_dssp=True):
         return None, None, f"Chain {chain} not found"
     
     if verify_dssp:
+        # The strict path: lets us actually verify "mainly alpha" means zero beta
+        # content, not just trust CATH's own classification
         # Run DSSP
         try:
             dssp = DSSP(model, file_path, dssp='mkdssp')
         except Exception as e:
             return None, None, f"DSSP failed: {e}"
         
+        # DSSP is keyed by (chain_id, (het_flag, res_seq, icode)) tuples
         # Extract residues for target chain
         chain_residues = []
         for key in dssp.keys():
@@ -164,6 +171,7 @@ def extract_sequence(pdb_id, chain, cif_dir, pdbl, parser, verify_dssp=True):
         if not chain_residues:
             return None, None, "No DSSP residues"
         
+        # DSSP codes: E = extended strand (beta sheet), B = beta bridge
         # Check for beta
         beta_codes = {'E', 'B'}
         n_beta = sum(1 for _, _, ss in chain_residues if ss in beta_codes)
@@ -171,21 +179,26 @@ def extract_sequence(pdb_id, chain, cif_dir, pdbl, parser, verify_dssp=True):
         if n_beta > 0:
             return None, None, f"Has {n_beta} beta residues"
         
+        # Sort by residue number since DSSP dict iteration order isn't guaranteed to match
+        # sequence order; 'X' is DSSP's placeholder for an unknown residue
         # Extract sequence
         chain_residues.sort(key=lambda x: x[0])
         sequence = ''.join(aa for _, aa, _ in chain_residues if aa != 'X')
         
+        # DSSP codes: H = alpha helix, G = 3-10 helix, I = pi helix
         # Helix fraction
         helix_codes = {'H', 'G', 'I'}
         n_helix = sum(1 for _, _, ss in chain_residues if ss in helix_codes)
         helix_frac = n_helix / len(chain_residues) if chain_residues else 0
         
     else:
+        # Faster path: trusts CATH's own "mainly alpha" classification instead of DSSP
         # Just extract sequence without DSSP
         from Bio.PDB.Polypeptide import protein_letters_3to1
         
         residues = []
         for res in model[chain]:
+            # Blank hetfield excludes waters/ligands/hetero groups, per Biopython convention
             if res.id[0] == ' ':  # Standard residue
                 resname = res.resname
                 if resname in protein_letters_3to1:
@@ -209,6 +222,8 @@ def save_results(results, fasta_path, csv_path):
     with open(fasta_path, 'w') as f:
         for p in results:
             hf = f"|helix={p['helix_fraction']:.2f}" if p['helix_fraction'] else ""
+            # Header format consumed by parse_fasta_header() in fix_datasets_alpha_train.py:
+            # "<pdb_id><chain>|len=<N>|helix=<frac>|<cath_code>"
             f.write(f">{p['pdb_id']}{p['chain']}|len={p['length']}{hf}|{p['cath_codes']}\n")
             f.write(f"{p['sequence']}\n")
     
@@ -216,6 +231,9 @@ def save_results(results, fasta_path, csv_path):
         f.write("pdb_id,chain,length,helix_fraction,cath_codes,sequence\n")
         for p in results:
             hf = f"{p['helix_fraction']:.3f}" if p['helix_fraction'] else ""
+            # NOTE: possible bug -- cath_codes is built elsewhere via ','.join(...) over a set
+            # of codes, so it can itself contain commas; this manual (unquoted) CSV writer
+            # would then produce extra columns for such rows when read back with pd.read_csv.
             f.write(f"{p['pdb_id']},{p['chain']},{p['length']},{hf},{p['cath_codes']},{p['sequence']}\n")
 
 
@@ -223,6 +241,7 @@ def save_results(results, fasta_path, csv_path):
 # MAIN
 # ============================================================
 def main():
+    """Download CATH Class 1 domains, extract+verify their sequences, and save as FASTA/CSV."""
     print("=" * 60)
     print("CATH Class 1 (Mainly Alpha) Protein Extraction")
     print("=" * 60)
@@ -242,7 +261,10 @@ def main():
     parser = MMCIFParser(QUIET=True)
     
     results = []
-    seen_sequences = set()
+    seen_sequences = set()  # dedup: skip a chain if we've already kept an identical sequence
+    # NOTE: possible bug -- declared but never populated or read anywhere below; looks like
+    # an intended file-path cache that was never wired up. Harmless in practice since
+    # Bio.PDB's PDBList.retrieve_pdb_file already skips re-downloading files that exist on disk.
     downloaded_pdbs = {}  # Cache file paths
     
     chains_list = list(cath_domains.keys())
@@ -274,11 +296,14 @@ def main():
             print(f"    [skip] {pdb_id}{chain}: length {len(seq)} outside {MIN_LENGTH}-{MAX_LENGTH}")
             continue
         
+        # Same sequence can recur across multiple PDB entries/chains
         # Skip duplicates
         if seq in seen_sequences:
             continue
         seen_sequences.add(seq)
         
+        # A chain can map to multiple domain entries, so collapse to a de-duplicated,
+        # comma-joined string of unique CATH codes
         # Get CATH info for this chain
         domain_info = cath_domains[(pdb_id, chain)]
         cath_codes = ','.join(set(d['cath_code'] for d in domain_info))
@@ -295,6 +320,8 @@ def main():
         hf_str = f"{helix_frac:.0%}" if helix_frac else "N/A"
         print(f"    [{len(results)}/{MAX_PROTEINS}] {pdb_id}{chain}: len={len(seq)}, helix={hf_str}")
         
+        # This is a long-running scrape over many PDB downloads, so checkpoint
+        # periodically in case it's interrupted partway through
         # Flush results every 10 proteins
         if len(results) % 10 == 0:
             save_results(results, OUTPUT_FASTA, OUTPUT_CSV)

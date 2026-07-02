@@ -472,6 +472,7 @@ def download_pdb(pdb_id, output_dir="pdbs"):
     """Download a PDB file from RCSB."""
     os.makedirs(output_dir, exist_ok=True)
     
+    # RCSB's static file download endpoint -- one flat .pdb file per entry
     url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
     response = requests.get(url)
     
@@ -499,12 +500,14 @@ def get_sequence_from_pdb_file(pdb_path, chain="A"):
             if ch.id == chain:
                 seq = ""
                 for residue in ch:
+                    # Blank hetfield excludes HETATM records
                     if residue.id[0] == " ":  # Standard residue
                         resname = residue.resname
                         if resname in protein_letters_3to1:
                             seq += protein_letters_3to1[resname]
                 return seq
     
+    # Fall back to whichever chain yields a non-empty sequence
     # If chain A not found, try first chain
     for model in structure:
         for ch in model:
@@ -535,11 +538,12 @@ def verify_no_beta_strands(pdb_path):
         
         dssp = DSSP(model, pdb_path, dssp='mkdssp')
         
-        ss_elements = [res[2] for res in dssp]
+        ss_elements = [res[2] for res in dssp]  # per-residue DSSP secondary-structure code
         
         # Check for beta strands (E) or beta bridges (B)
         has_beta = any(ss in ['E', 'B'] for ss in ss_elements)
         
+        # H/G/I = alpha/3-10/pi helix, T/S/-/C/' ' = turn/bend/coil, E/B = beta
         # Count secondary structure
         n_helix = sum(1 for ss in ss_elements if ss in ['H', 'G', 'I'])
         n_coil = sum(1 for ss in ss_elements if ss in ['T', 'S', '-', 'C', ' '])
@@ -558,6 +562,7 @@ def verify_no_beta_strands(pdb_path):
 
 
 def main():
+    """Download each candidate PDB, verify it's truly all-alpha via DSSP, and save a summary CSV."""
     output_dir = "all_alpha_pdbs"
     os.makedirs(output_dir, exist_ok=True)
     
@@ -573,6 +578,7 @@ def main():
         if not pdb_path:
             continue
         
+        # The curated list above is only a starting guess -- DSSP is the ground truth
         # Verify no beta strands
         is_all_alpha, ss_counts = verify_no_beta_strands(pdb_path)
         
@@ -586,6 +592,7 @@ def main():
             os.remove(pdb_path)
             continue
         
+        # Keep only lengths in a range that's tractable for downstream folding runs
         # Get sequence
         seq = get_sequence_from_pdb_file(pdb_path)
         if seq and 30 <= len(seq) <= 400:
@@ -609,7 +616,7 @@ def main():
                 print(f"Sequence not found, removing")
             os.remove(pdb_path)
         
-        time.sleep(0.1)
+        time.sleep(0.1)  # gentle rate limiting to avoid hammering the RCSB download endpoint
     
     # Save summary
     if verified_proteins:

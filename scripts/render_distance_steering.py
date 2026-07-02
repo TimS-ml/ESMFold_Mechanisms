@@ -37,7 +37,7 @@ from PIL import Image
 
 def parse_magnitude(filename):
     """Extract magnitude from filename like frame_0003_mag_1.2345.pdb"""
-    m = re.search(r"mag_([\d]+\.[\d]+)\.pdb", os.path.basename(filename))
+    m = re.search(r"mag_([\d]+\.[\d]+)\.pdb", os.path.basename(filename))  # capture the decimal after "mag_"
     if m:
         return float(m.group(1))
     return None
@@ -55,6 +55,7 @@ def get_cb_coords_by_residue(pdb_path):
         for line in f:
             if not (line.startswith("ATOM") or line.startswith("HETATM")):
                 continue
+            # Fixed-width PDB columns: atom name cols 13-16, residue seq cols 23-26, x/y/z cols 31-38/39-46/47-54
             atom_name = line[12:16].strip()
             # Use 0-based residue index
             res_seq = int(line[22:26].strip()) - 1
@@ -66,6 +67,8 @@ def get_cb_coords_by_residue(pdb_path):
             elif atom_name == "CB":
                 cb_coords[res_seq] = np.array([x, y, z])
 
+    # Cβ better reflects sidechain orientation than the backbone Cα; glycine has no
+    # CB so it naturally falls back to CA here
     # Merge: prefer CB, fall back to CA
     merged = {}
     all_res = set(ca_coords.keys()) | set(cb_coords.keys())
@@ -81,7 +84,7 @@ def compute_cross_strand_distances(pdb_path, strand1_residues, strand2_residues)
     coords = get_cb_coords_by_residue(pdb_path)
     n1 = len(strand1_residues)
     n2 = len(strand2_residues)
-    dist_matrix = np.full((n1, n2), np.nan)
+    dist_matrix = np.full((n1, n2), np.nan)  # NaN default -- entries stay NaN if a residue's coords are missing
 
     for i, r1 in enumerate(strand1_residues):
         for j, r2 in enumerate(strand2_residues):
@@ -101,6 +104,8 @@ def mag_color_at_t(t):
     return (r, g, b)
 
 
+# Custom colormaps (rather than a stock matplotlib cmap) so the exact same color stops can
+# be reproduced manually inside the generated PyMOL script below (PyMOL can't import matplotlib)
 # Distance colormap for "closer" mode:
 # far (light/pale green) -> close (dark green)
 CMAP_CLOSER = LinearSegmentedColormap.from_list(
@@ -129,6 +134,7 @@ CMAP_FARTHER = LinearSegmentedColormap.from_list(
     N=256
 )
 
+# 8 Å is a conventional Cβ-Cβ cutoff for calling two residues "in contact" in structural biology
 CONTACT_THRESHOLD = 8.0  # Angstroms for neon highlight
 
 
@@ -141,16 +147,18 @@ def render_pymol_frames(pdb_folder, frame_dir, magnitudes,
     Cross-strand residues colored by mean distance (matching matrix colormap),
     rest gray."""
 
-    mag_list = json.dumps(magnitudes.tolist())
+    mag_list = json.dumps(magnitudes.tolist())  # serialize for embedding into the generated PyMOL script string
     mag_max = float(magnitudes.max())
     mag_min = float(magnitudes.min())
     dist_list = json.dumps([float(d) for d in mean_dists])
     dist_min = float(min(mean_dists))
     dist_max = float(max(mean_dists))
 
+    # Used to fix the camera view before any steering is applied
     # Find baseline frame (mag closest to 0)
     baseline_idx = int(np.argmin(np.abs(magnitudes)))
 
+    # Our residue indices are 0-based throughout this script
     # PyMOL uses 1-based residue numbering
     s1_sele = " or ".join(f"resi {r+1}" for r in strand1_residues)
     s2_sele = " or ".join(f"resi {r+1}" for r in strand2_residues)
@@ -201,12 +209,12 @@ cmd.delete("ref")
 for i, pdb_path in enumerate(pdb_files):
     d = mean_dists[i] if i < len(mean_dists) else mean_dists[-1]
     # t=0 means close (dark), t=1 means far (light)
-    t = max(0.0, min(1.0, (d - dist_min) / (dist_max - dist_min + 1e-12)))
+    t = max(0.0, min(1.0, (d - dist_min) / (dist_max - dist_min + 1e-12)))  # 1e-12 guards divide-by-zero
 
     cmd.load(pdb_path, "frame")
     cmd.hide("everything", "frame")
     cmd.show("cartoon", "frame")
-    cmd.dss("frame")
+    cmd.dss("frame")  # assign secondary structure for this frame
 
     # Color everything gray first
     cmd.color("gray80", "frame")
@@ -217,6 +225,7 @@ for i, pdb_path in enumerate(pdb_files):
     cmd.color("dist_c", "frame and ({s1_sele})")
     cmd.color("dist_c", "frame and ({s2_sele})")
 
+    # Re-apply the baseline camera view so every independently-loaded frame renders from the same angle/zoom
     cmd.set_view(saved_view)
 
     frame_path = os.path.join("{frame_dir}", f"pymol_{{i:04d}}.png")
@@ -257,9 +266,10 @@ def render_info_frames(frame_dir, magnitudes, all_dist_matrices,
     mag_min, mag_max = magnitudes.min(), magnitudes.max()
 
     # Compute global distance range across all frames for consistent coloring
+    # (fixed here rather than per-frame so the colorbar/colors don't rescale and flicker frame-to-frame)
     all_dists = np.concatenate([m.flatten() for m in all_dist_matrices])
-    all_dists = all_dists[~np.isnan(all_dists)]
-    d_min_global = max(all_dists.min() - 1, 0)
+    all_dists = all_dists[~np.isnan(all_dists)]  # drop entries where a residue's coords were missing
+    d_min_global = max(all_dists.min() - 1, 0)  # 1 Å padding on each side; distance can't go below 0
     d_max_global = all_dists.max() + 1
 
     cmap = CMAP_CLOSER
@@ -278,6 +288,8 @@ def render_info_frames(frame_dir, magnitudes, all_dist_matrices,
         dist_matrix = all_dist_matrices[idx]
 
         fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
+        # 2 stacked rows (by height_ratio) map 1:1 to the 2 add_subplot(gs[N]) calls below:
+        # combined title/progress-bar row, and the pairwise distance matrix row
         gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 3.5],
                               hspace=0.3, left=0.14, right=0.90, top=0.96, bottom=0.06)
 
@@ -302,7 +314,7 @@ def render_info_frames(frame_dir, magnitudes, all_dist_matrices,
         ax.barh(bar_y, t, height=bar_h, color=color, edgecolor="none")
 
         # Tick labels
-        n_ticks = 5
+        n_ticks = 5  # number of evenly-spaced tick marks drawn along the progress bar
         tick_vals = np.linspace(mag_min, mag_max, n_ticks)
         for tv in tick_vals:
             tick_t = (tv - mag_min) / (mag_max - mag_min + 1e-12)
@@ -350,12 +362,13 @@ def render_info_frames(frame_dir, magnitudes, all_dist_matrices,
         cbar.set_label("Cβ-Cβ Distance (Å)", fontsize=13)
         cbar.ax.tick_params(labelsize=11)
 
+        # Thicker, darker axes border for visual polish around the distance matrix
         for spine in ax.spines.values():
             spine.set_linewidth(1.5)
             spine.set_color("#666")
 
         fig.savefig(os.path.join(frame_dir, f"info_{idx:04d}.png"), dpi=dpi)
-        plt.close(fig)
+        plt.close(fig)  # free the figure -- otherwise memory grows unbounded over hundreds of frames
 
         if (idx + 1) % 20 == 0 or idx == n_frames - 1:
             print(f"  Info panel {idx+1}/{n_frames}")
@@ -364,6 +377,7 @@ def render_info_frames(frame_dir, magnitudes, all_dist_matrices,
 # ── Composite ──────────────────────────────────────────────────────
 
 def composite_frames(frame_dir, n_frames):
+    """Paste each frame's PyMOL render and info panel side-by-side into one final PNG."""
     print("Compositing dual panels...")
     for idx in range(n_frames):
         pymol_path = os.path.join(frame_dir, f"pymol_{idx:04d}.png")
@@ -377,10 +391,12 @@ def composite_frames(frame_dir, n_frames):
         pymol_img = Image.open(pymol_path).convert("RGB")
         info_img  = Image.open(info_path).convert("RGB")
 
+        # Canvas is wide enough for both panels side-by-side, tall enough for the taller of the two
         canvas_h = max(pymol_img.height, info_img.height)
         canvas_w = pymol_img.width + info_img.width
 
         composite = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+        # Center each panel vertically in case the two panels differ in height
         pymol_y = (canvas_h - pymol_img.height) // 2
         info_y  = (canvas_h - info_img.height) // 2
 
@@ -395,15 +411,16 @@ def composite_frames(frame_dir, n_frames):
 # ── ffmpeg ──────────────────────────────────────────────────────────
 
 def stitch_video(frame_dir, output_mp4, fps):
+    """Encode the composited final_%04d.png frame sequence into an H.264 MP4 via ffmpeg."""
     print(f"\nStitching video ({fps} fps)...")
     subprocess.run([
-        "ffmpeg", "-y",
+        "ffmpeg", "-y",  # -y: overwrite output_mp4 if it already exists
         "-framerate", str(fps),
         "-i", os.path.join(frame_dir, "final_%04d.png"),
-        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",  # libx264 requires even width/height
         "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-crf", "18",
+        "-pix_fmt", "yuv420p",  # widest compatibility across players
+        "-crf", "18",  # visually-lossless quality
         output_mp4,
     ], check=True)
 
@@ -411,6 +428,7 @@ def stitch_video(frame_dir, output_mp4, fps):
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
+    """Parse args, compute per-frame distance matrices, render both panels, then composite and encode the video."""
     parser = argparse.ArgumentParser(
         description="Render dual-panel steering sweep animation with distance matrix"
     )
@@ -435,6 +453,8 @@ def main():
                         help="Distance threshold for neon contact highlight (Å)")
     args = parser.parse_args()
 
+    # Mutate the module-level constant so render_info_frames (defined above, at module
+    # scope) picks up the user's --contact_threshold without needing it passed as an argument
     global CONTACT_THRESHOLD
     CONTACT_THRESHOLD = args.contact_threshold
 
@@ -442,6 +462,8 @@ def main():
     strand2_full = [int(x.strip()) for x in args.strand2.split(",")]
 
     # Subsample to n_pairs evenly spaced residues from each strand
+    # (caps n_pairs so we never try to select more residues than a strand actually has;
+    # subsampling keeps the distance matrix small/readable even for long strands)
     n_pairs = min(args.n_pairs, len(strand1_full), len(strand2_full))
     idx1 = np.linspace(0, len(strand1_full) - 1, n_pairs, dtype=int)
     idx2 = np.linspace(0, len(strand2_full) - 1, n_pairs, dtype=int)
@@ -467,9 +489,9 @@ def main():
 
     # Extract magnitudes from filenames
     magnitudes = np.array([parse_magnitude(f) for f in pdb_files])
-    if None in magnitudes:
+    if None in magnitudes:  # membership check against the float array catches unparsed (None) entries
         print("Warning: couldn't parse magnitude from some filenames, using linear ramp")
-        magnitudes = np.linspace(0, 15, n_frames)
+        magnitudes = np.linspace(0, 15, n_frames)  # arbitrary placeholder range if parsing failed
     print(f"Magnitude range: {magnitudes.min():.4f} → {magnitudes.max():.4f}")
 
     # Compute pairwise distance matrices for each frame
@@ -483,11 +505,13 @@ def main():
     mean_dists = [np.nanmean(m) for m in all_dist_matrices]
     print(f"Mean cross-strand distance range: {min(mean_dists):.2f} → {max(mean_dists):.2f} Å")
 
+    # This is also the magnitudes.npy consumed by the sibling render_dual_panel_*.py
+    # scripts if they're pointed at this same pdb_folder
     # Save for later analysis
     np.save(os.path.join(args.pdb_folder, "magnitudes.npy"), magnitudes)
     np.save(os.path.join(args.pdb_folder, "mean_distances.npy"), np.array(mean_dists))
 
-    frame_dir = tempfile.mkdtemp(prefix="steering_sweep_")
+    frame_dir = tempfile.mkdtemp(prefix="steering_sweep_")  # scratch dir for per-frame PNGs before video encoding
 
     try:
         render_pymol_frames(
@@ -508,6 +532,8 @@ def main():
         print(f"\nDone! → {args.output}")
 
     finally:
+        # Always clean up the scratch directory (intermediate PNGs + generated PyMOL script),
+        # even if rendering/encoding raised an exception above
         for f in glob.glob(os.path.join(frame_dir, "*.png")):
             os.remove(f)
         for f in glob.glob(os.path.join(frame_dir, "*.py")):

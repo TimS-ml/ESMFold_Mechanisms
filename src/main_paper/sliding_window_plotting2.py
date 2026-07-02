@@ -36,26 +36,38 @@ def plot_hairpin_outputs(
     """
     Create a plot showing % outputs with hairpin for ablation conditions.
     """
+    # Unlike sliding_window_plotting.py (which plots real ablation_results.csv
+    # data), this function fabricates illustrative placeholder curves below --
+    # useful for drafting/mocking up the figure layout before real sweep
+    # results existed. No CSV or experiment output is read anywhere here.
     fig, ax = plt.subplots(figsize=figsize)
     
     if random_seed is not None:
+        # Fixed seed makes the synthetic noise (and thus the whole figure)
+        # reproducible across repeated runs with the same arguments.
         np.random.seed(random_seed)
     
     n_blocks = len(blocks)
     
     # Generate synthetic data for ablate pair2seq (green)
     # Starts around 70%, rises slowly to ~80%
+    # Exponential-saturation curve: starts at 70% (block == blocks.min()) and
+    # rises toward an asymptote of 70+10=80% as block index increases; 0.15 is
+    # the rate constant controlling how quickly it approaches that asymptote.
     base_pair2seq = 70 + 10 * (1 - np.exp(-0.15 * (blocks - blocks.min())))
     noise_pair2seq = np.random.normal(0, noise_std, n_blocks)
     pct_pair2seq = base_pair2seq + noise_pair2seq
     
     # Generate synthetic data for ablate seq2pair (orange)
     # Hovers around 90%
+    # Flat baseline curve, constant 93% for every block.
     base_seq2pair = 93 * np.ones(n_blocks)
     noise_seq2pair = np.random.normal(0, noise_std, n_blocks)
     pct_seq2pair = base_seq2pair + noise_seq2pair
     
     # Fill areas under curves
+    # Shade the region BETWEEN the two curves to visually emphasize the gap
+    # between the two ablation conditions.
     ax.fill_between(blocks, pct_seq2pair, pct_pair2seq,
                     alpha=0.3, color=ablate_pair2seq_color, zorder=2)
     # ax.fill_between(blocks, 0, pct_seq2pair,
@@ -99,9 +111,12 @@ def plot_hairpin_outputs(
 
 
 def main():
+    """CLI entry point: render the illustrative (synthetic-data) hairpin-output figure."""
     parser = argparse.ArgumentParser(description='Plot hairpin output percentages')
     parser.add_argument('--output', type=str, default='hairpin_outputs.png',
                         help='Output path for figure')
+    # Default range covers roughly the back half of the 48-block trunk, where
+    # (per this paper's findings) structural decisions concentrate.
     parser.add_argument('--blocks', type=int, nargs='+', default=range(27, 48),
                         help='Block indices to plot')
     parser.add_argument('--figsize', type=float, nargs=2, default=[7, 6],

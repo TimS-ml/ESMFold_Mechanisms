@@ -36,7 +36,7 @@ from PIL import Image
 
 def parse_z_scale(filename):
     """Extract z-scale value from filename like frame_003_zscale_0.1234.pdb"""
-    m = re.search(r"zscale_([\d]+\.[\d]+)\.pdb", os.path.basename(filename))
+    m = re.search(r"zscale_([\d]+\.[\d]+)\.pdb", os.path.basename(filename))  # capture the decimal after "zscale_"
     if m:
         return float(m.group(1))
     return None
@@ -50,6 +50,7 @@ def get_ca_coords(pdb_path):
     with open(pdb_path) as f:
         for line in f:
             if (line.startswith("ATOM") or line.startswith("HETATM")):
+                # Fixed-width PDB columns: atom name is cols 13-16, x/y/z are cols 31-38/39-46/47-54
                 atom_name = line[12:16].strip()
                 if atom_name == "CA":
                     x = float(line[30:38])
@@ -65,10 +66,10 @@ def mean_pairwise_ca_distance(pdb_path):
     if len(ca) < 2:
         return 0.0
     # Pairwise distances (upper triangle only)
-    diff = ca[:, None, :] - ca[None, :, :]
+    diff = ca[:, None, :] - ca[None, :, :]  # broadcast to a full (n, n, 3) pairwise difference tensor
     dists = np.sqrt((diff ** 2).sum(-1))
     n = len(ca)
-    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)  # k=1 excludes the diagonal (self-distance=0) and lower triangle (duplicates)
     return dists[mask].mean()
 
 
@@ -92,10 +93,11 @@ def render_pymol_frames(pdb_folder, frame_dir, z_scales, pw, ph):
     computes secondary structure correctly for every frame.
     """
 
-    zs_list = json.dumps(z_scales.tolist())
+    zs_list = json.dumps(z_scales.tolist())  # serialize for embedding into the generated PyMOL script string
     zs_max = float(z_scales.max())
     zs_min = float(z_scales.min())
 
+    # z_scale=1.0 is the original, unmodified pair-representation scale (the reference/baseline)
     # Find the frame closest to z_scale=1.0 for camera setup
     baseline_idx = int(np.argmin(np.abs(z_scales - 1.0)))
 
@@ -111,6 +113,8 @@ baseline_idx = {baseline_idx}
 n = len(pdb_files)
 
 def z_rgb(t):
+    # Duplicated from the outer z_color_at_t() -- this runs inside a separate PyMOL
+    # subprocess, which can't call back into the launching Python process
     r = 0.75 - t * 0.65
     g = 0.90 - t * 0.10
     b = 0.65 - t * 0.60
@@ -139,7 +143,7 @@ cmd.delete("ref")
 # Second pass: render each frame independently
 for i, pdb_path in enumerate(pdb_files):
     zs = z_scales[i] if i < len(z_scales) else z_scales[-1]
-    t = max(0.0, min(1.0, (zs - z_min) / (z_max - z_min + 1e-12)))
+    t = max(0.0, min(1.0, (zs - z_min) / (z_max - z_min + 1e-12)))  # 1e-12 guards divide-by-zero if z_min==z_max
 
     cmd.load(pdb_path, "frame")
     cmd.hide("everything", "frame")
@@ -150,6 +154,8 @@ for i, pdb_path in enumerate(pdb_files):
     cmd.set_color("zscale_c", rgb)
     cmd.color("zscale_c", "frame")
 
+    # Re-apply the baseline camera view captured earlier so every independently-loaded
+    # frame is rendered from the same angle/zoom
     cmd.set_view(saved_view)
 
     frame_path = os.path.join("{frame_dir}", f"pymol_{{i:04d}}.png")
@@ -197,6 +203,8 @@ def render_info_frames(frame_dir, z_scales, ca_distances, pw, ph, dpi=150):
         color = z_color_at_t(t)
 
         fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
+        # 4 stacked rows (by height_ratio) map 1:1 to the 4 add_subplot(gs[N]) calls below:
+        # title, progress bar, small caption label, running distance plot
         gs = fig.add_gridspec(4, 1, height_ratios=[0.6, 0.3, 0.15, 2.5],
                               hspace=0.5, left=0.15, right=0.90, top=0.93, bottom=0.10)
 
@@ -220,6 +228,7 @@ def render_info_frames(frame_dir, z_scales, ca_distances, pw, ph, dpi=150):
         # Filled portion
         ax.barh(0.5, t, height=0.6, color=color, edgecolor="none")
 
+        # Fixed candidate tick positions; only drawn if they fall inside the actual z-scale range
         # Tick labels
         for tick_val in [0.0, 0.5, 1.0, 1.5, 2.0]:
             tick_t = (tick_val - z_min) / (z_max - z_min + 1e-12)
@@ -243,6 +252,8 @@ def render_info_frames(frame_dir, z_scales, ca_distances, pw, ph, dpi=150):
         ax.plot(z_scales, ca_distances, color="#ddd", linewidth=1.5, zorder=1)
 
         # Plot up to current frame with color gradient
+        # matplotlib can't draw one Line2D with a per-point color gradient directly, so
+        # this draws many short 2-point segments, each colored for its own z-scale value
         if idx > 0:
             for i in range(idx):
                 seg_t = np.clip((z_scales[i] - z_min) / (z_max - z_min + 1e-12), 0, 1)
@@ -254,6 +265,8 @@ def render_info_frames(frame_dir, z_scales, ca_distances, pw, ph, dpi=150):
         ax.plot(zs, ca_distances[idx], 'o', color=color, markersize=10,
                 zorder=4, markeredgecolor="white", markeredgewidth=2)
 
+        # Recomputed locally here just for this annotation; unrelated to the camera
+        # baseline_idx computed in render_pymol_frames
         # Baseline marker at z=1.0
         baseline_idx = np.argmin(np.abs(z_scales - 1.0))
         ax.axvline(x=1.0, color="#ccc", linestyle="--", linewidth=1, zorder=0)
@@ -269,7 +282,7 @@ def render_info_frames(frame_dir, z_scales, ca_distances, pw, ph, dpi=150):
         ax.spines["right"].set_visible(False)
 
         fig.savefig(os.path.join(frame_dir, f"info_{idx:04d}.png"), dpi=dpi)
-        plt.close(fig)
+        plt.close(fig)  # free the figure -- otherwise memory grows unbounded over hundreds of frames
 
         if (idx + 1) % 20 == 0 or idx == n_frames - 1:
             print(f"  Info panel {idx+1}/{n_frames}")
@@ -278,6 +291,7 @@ def render_info_frames(frame_dir, z_scales, ca_distances, pw, ph, dpi=150):
 # ── Composite ──────────────────────────────────────────────────────
 
 def composite_frames(frame_dir, n_frames):
+    """Paste each frame's PyMOL render and info panel side-by-side into one final PNG."""
     print("Compositing dual panels...")
     for idx in range(n_frames):
         pymol_path = os.path.join(frame_dir, f"pymol_{idx:04d}.png")
@@ -291,10 +305,12 @@ def composite_frames(frame_dir, n_frames):
         pymol_img = Image.open(pymol_path).convert("RGB")
         info_img  = Image.open(info_path).convert("RGB")
 
+        # Canvas is wide enough for both panels side-by-side, tall enough for the taller of the two
         canvas_h = max(pymol_img.height, info_img.height)
         canvas_w = pymol_img.width + info_img.width
 
         composite = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+        # Center each panel vertically in case the two panels differ in height
         pymol_y = (canvas_h - pymol_img.height) // 2
         info_y  = (canvas_h - info_img.height) // 2
 
@@ -309,15 +325,16 @@ def composite_frames(frame_dir, n_frames):
 # ── ffmpeg ──────────────────────────────────────────────────────────
 
 def stitch_video(frame_dir, output_mp4, fps):
+    """Encode the composited final_%04d.png frame sequence into an H.264 MP4 via ffmpeg."""
     print(f"\nStitching video ({fps} fps)...")
     subprocess.run([
-        "ffmpeg", "-y",
+        "ffmpeg", "-y",  # -y: overwrite output_mp4 if it already exists
         "-framerate", str(fps),
         "-i", os.path.join(frame_dir, "final_%04d.png"),
-        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",  # libx264 requires even width/height
         "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-crf", "18",
+        "-pix_fmt", "yuv420p",  # widest compatibility across players
+        "-crf", "18",  # visually-lossless quality
         output_mp4,
     ], check=True)
 
@@ -325,6 +342,7 @@ def stitch_video(frame_dir, output_mp4, fps):
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
+    """Parse args, compute per-frame stats, render both panels, then composite and encode the video."""
     parser = argparse.ArgumentParser(
         description="Render dual-panel z-scale sweep animation"
     )
@@ -349,9 +367,9 @@ def main():
 
     # Extract z-scales from filenames
     z_scales = np.array([parse_z_scale(f) for f in pdb_files])
-    if None in z_scales:
+    if None in z_scales:  # membership check against the float array catches unparsed (None) entries
         print("Warning: couldn't parse z-scale from some filenames, using linear ramp")
-        z_scales = np.linspace(0, 2, n_frames)
+        z_scales = np.linspace(0, 2, n_frames)  # arbitrary placeholder range if parsing failed
     print(f"Z-scale range: {z_scales.min():.4f} → {z_scales.max():.4f}")
 
     # Compute mean pairwise CA distance for each frame
@@ -363,7 +381,7 @@ def main():
     np.save(os.path.join(args.pdb_folder, "z_scales.npy"), z_scales)
     np.save(os.path.join(args.pdb_folder, "ca_distances.npy"), ca_distances)
 
-    frame_dir = tempfile.mkdtemp(prefix="z_sweep_panel_")
+    frame_dir = tempfile.mkdtemp(prefix="z_sweep_panel_")  # scratch dir for per-frame PNGs before video encoding
 
     try:
         render_pymol_frames(
@@ -381,6 +399,8 @@ def main():
         print(f"\nDone! → {args.output}")
 
     finally:
+        # Always clean up the scratch directory (intermediate PNGs + generated PyMOL script),
+        # even if rendering/encoding raised an exception above
         for f in glob.glob(os.path.join(frame_dir, "*.png")):
             os.remove(f)
         for f in glob.glob(os.path.join(frame_dir, "*.py")):

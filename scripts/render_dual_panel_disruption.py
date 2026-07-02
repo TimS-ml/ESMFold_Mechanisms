@@ -46,8 +46,8 @@ def render_pymol_frames(pdb_folder, frame_dir, magnitudes, pw, ph,
     object, color it, ray-trace, then delete the temp object.
     """
 
-    mag_list = json.dumps(magnitudes.tolist())
-    dm = display_max if display_max is not None else float(magnitudes.max())
+    mag_list = json.dumps(magnitudes.tolist())  # serialize for embedding into the generated PyMOL script string
+    dm = display_max if display_max is not None else float(magnitudes.max())  # upper end of the color/t normalization range
 
     pymol_script = f'''
 import os, glob, json
@@ -98,6 +98,8 @@ for state in range(1, n_states + 1):
     cmd.hide("everything", "frame")
     cmd.show("cartoon", "frame")
 
+    # Coloring the extracted single-state "frame" object (rather than the multi-state
+    # "sweep" object directly) is what makes the per-frame recoloring below actually work
     # Color the single-state object — this works reliably
     cmd.color("gray80", "frame")
     cmd.color("splitpea", f"frame and resi {turn_resi}")
@@ -144,12 +146,12 @@ def render_info_frames(frame_dir, magnitudes, seq,
     """
 
     mag_min = 0.0
-    actual_max = 0.19 
+    actual_max = 0.19  # matches the --max_std default in main(): the real sigma scale used when these frames were generated
     norm_max = display_max if display_max is not None else actual_max
     
     n_frames = len(magnitudes)
     hp_start, hp_end = strand1_0, strand2_1
-    hp_len = hp_end - hp_start
+    hp_len = hp_end - hp_start  # NOTE: possible bug -- computed but never used below (dead variable)
     residues = list(range(hp_start, hp_end))
 
     fig_w, fig_h = pw / dpi, ph / dpi
@@ -163,6 +165,7 @@ def render_info_frames(frame_dir, magnitudes, seq,
     
     # Precompute x positions with gaps between regions
     def _build_x_positions(residues, strand1_0, strand1_1, turn_0, turn_1, strand2_0):
+        """Assign x coords with extra gaps between strand1, turn, and strand2 regions."""
         positions = []
         x = 0.0
         prev_region = None
@@ -185,11 +188,16 @@ def render_info_frames(frame_dir, magnitudes, seq,
     print(f"Rendering {n_frames} info panels (Max Label: {actual_max})...")
 
     for idx, raw_mag in enumerate(magnitudes):
+        # Heuristic: if the whole magnitudes array already looks like it's in real sigma
+        # units (max <= 0.2, roughly matching actual_max=0.19), use raw_mag as-is;
+        # otherwise assume raw_mag is normalized to [0,1] and rescale by actual_max
         display_mag = raw_mag if magnitudes.max() <= 0.2 else raw_mag * actual_max
         t = np.clip((display_mag - mag_min) / (norm_max - mag_min + 1e-12), 0, 1)
         sc = strand_color_at_t(t)
 
         fig = plt.figure(figsize=(fig_w, fig_h), facecolor="white")
+        # 4 stacked rows (by height_ratio) map 1:1 to the 4 add_subplot(gs[N]) calls below:
+        # title, progress bar, sequence strip w/ arrows, equation caption
         gs = fig.add_gridspec(4, 1, height_ratios=[0.8, 0.4, 3.2, 1.2],
                               hspace=0.45, left=0.08, right=0.92, top=0.95, bottom=0.05)
 
@@ -231,6 +239,7 @@ def render_info_frames(frame_dir, magnitudes, seq,
             
             if target_list is not None: target_list.append(scaled_x)
 
+            # One colored square per residue, labeled with its amino acid letter
             # Boxes
             rect = plt.Rectangle((scaled_x - block_size/2, y_offset - block_size/2), 
                                  block_size, block_size,
@@ -241,9 +250,11 @@ def render_info_frames(frame_dir, magnitudes, seq,
             ax.text(scaled_x, y_offset, aa, ha="center", va="center", fontsize=18,
                     fontweight="bold", color=text_color, zorder=3)
 
-            arrow_scale = t * 3.5
+            arrow_scale = t * 3.5  # arrow length grows with intervention magnitude t in [0,1]
             arrow_base_y = y_offset + (block_size / 2) + 1.0 
 
+            # Both strands get an UPWARD arrow here (unlike the attraction script's up/down
+            # pair) since same-sign charge on both strands is what drives repulsion
             if region == "strand" and t > 0:
                 ax.arrow(scaled_x, arrow_base_y, 0, arrow_scale,
                         width=0.2,
@@ -258,6 +269,7 @@ def render_info_frames(frame_dir, magnitudes, seq,
 
         s1_mid, s2_mid, turn_mid = [np.mean(lst) if lst else 0 for lst in [s1_x, s2_x, turn_x]]
 
+        # Both strands shown with "+" (same charge) -- this is what causes repulsion
         # "+" signs
         if t > 0.1:
             for xpos in [s1_mid, s2_mid]:
@@ -271,6 +283,7 @@ def render_info_frames(frame_dir, magnitudes, seq,
         ax.text(turn_mid, label_y, "Turn", ha="center", fontsize=18, color="#6b8e6b")
         ax.text(s2_mid, label_y, "Strand 2", ha="center", fontsize=18, color=sc, fontweight="bold")
 
+        # Double-headed outward arrow ("<->") between the strands visually depicts repulsion
         # Repulsion
         if t > 0.0:
             rep_y = label_y - 1.5
@@ -280,6 +293,7 @@ def render_info_frames(frame_dir, magnitudes, seq,
                     ha="center", fontsize=18, color=sc, style="italic")
 
         # ── Equation Subplot ────────────────────────
+        # Renders the steering-vector update rule as a figure caption for documentation
         ax = fig.add_subplot(gs[3])
         ax.axis("off")
         ax.text(0.5, 1.2, "s  ←  s  +  α · σ · d_charge", fontsize=20, ha="center", 
@@ -288,7 +302,7 @@ def render_info_frames(frame_dir, magnitudes, seq,
                 fontsize=15, ha="center", color="black", style="italic")
 
         fig.savefig(os.path.join(frame_dir, f"info_{idx:04d}.png"), dpi=dpi)
-        plt.close(fig)
+        plt.close(fig)  # free the figure -- otherwise memory grows unbounded over hundreds of frames
 # ── Composite ──────────────────────────────────────────────────────
 
 def composite_frames(frame_dir, n_frames):
@@ -308,10 +322,12 @@ def composite_frames(frame_dir, n_frames):
         pymol_img = Image.open(pymol_path).convert("RGB")
         info_img  = Image.open(info_path).convert("RGB")
 
+        # Canvas is wide enough for both panels side-by-side, tall enough for the taller of the two
         canvas_h = max(pymol_img.height, info_img.height)
         canvas_w = pymol_img.width + info_img.width
 
         composite = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+        # Center each panel vertically in case the two panels differ in height
         pymol_y = (canvas_h - pymol_img.height) // 2
         info_y  = (canvas_h - info_img.height) // 2
 
@@ -326,15 +342,16 @@ def composite_frames(frame_dir, n_frames):
 # ── ffmpeg ──────────────────────────────────────────────────────────
 
 def stitch_video(frame_dir, output_mp4, fps):
+    """Encode the composited final_%04d.png frame sequence into an H.264 MP4 via ffmpeg."""
     print(f"\nStitching video ({fps} fps)...")
     subprocess.run([
-        "ffmpeg", "-y",
+        "ffmpeg", "-y",  # -y: overwrite output_mp4 if it already exists
         "-framerate", str(fps),
         "-i", os.path.join(frame_dir, "final_%04d.png"),
-        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",  # libx264 requires even width/height
         "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-crf", "18",
+        "-pix_fmt", "yuv420p",  # widest compatibility across players
+        "-crf", "18",  # visually-lossless quality
         output_mp4,
     ], check=True)
 
@@ -342,6 +359,7 @@ def stitch_video(frame_dir, output_mp4, fps):
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
+    """Parse args, load/derive per-frame magnitudes, render both panels, then composite and encode the video."""
     parser = argparse.ArgumentParser(
         description="Render dual-panel hairpin disruption animation"
     )
@@ -352,6 +370,10 @@ def main():
     parser.add_argument("--height", type=int, default=700)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--dpi", type=int, default=150)
+    # NOTE: possible bug -- help text says the default is "use actual max from magnitudes.npy",
+    # but default=0.19 is a fixed float (never None), so the `else magnitudes.max()` branch
+    # in `display_max = args.max_std if args.max_std is not None else magnitudes.max()` below
+    # is effectively unreachable via the CLI; help text appears stale relative to the code.
     parser.add_argument("--max_std", type=float, default=0.19,
                         help="Max magnitude in σ for display (default: use actual max from magnitudes.npy)")
     parser.add_argument("--strand1", default="2-5",
@@ -377,6 +399,8 @@ def main():
     print(f"Found {n_frames} PDB files")
     print(f"Output: {args.output} ({args.width*2}x{args.height} @ {args.fps} fps)")
 
+    # magnitudes.npy is expected to be saved alongside the frame_*.pdb files by whatever
+    # upstream sweep-generation process produced them
     mag_path = os.path.join(args.pdb_folder, "magnitudes.npy")
     if os.path.exists(mag_path):
         magnitudes = np.load(mag_path)
@@ -386,22 +410,25 @@ def main():
         magnitudes = np.linspace(0, 1, n_frames)
         print("No magnitudes.npy — using linear ramp")
 
+    # Guard against a mismatched frame/magnitude count (e.g. a partially-written sweep)
     if len(magnitudes) != n_frames:
         n_frames = min(len(magnitudes), n_frames)
         magnitudes = magnitudes[:n_frames]
         print(f"Truncated to {n_frames} frames")
 
+    # Parse "N-M" 1-indexed inclusive residue ranges from the CLI
     s1a, s1b = [int(x) for x in args.strand1.split("-")]
     ta, tb   = [int(x) for x in args.turn.split("-")]
     s2a, s2b = [int(x) for x in args.strand2.split("-")]
 
+    # Convert each 1-indexed inclusive range [a, b] to a 0-indexed half-open range [a-1, b)
     strand1_0, strand1_1 = s1a - 1, s1b
     turn_0, turn_1       = ta - 1, tb
     strand2_0, strand2_1 = s2a - 1, s2b
 
     display_max = args.max_std if args.max_std is not None else magnitudes.max()
 
-    frame_dir = tempfile.mkdtemp(prefix="dual_panel_")
+    frame_dir = tempfile.mkdtemp(prefix="dual_panel_")  # scratch dir for per-frame PNGs before video encoding
 
     try:
         render_pymol_frames(
@@ -424,6 +451,8 @@ def main():
         print(f"\nDone! → {args.output}")
 
     finally:
+        # Always clean up the scratch directory (intermediate PNGs + generated PyMOL script),
+        # even if rendering/encoding raised an exception above
         for f in glob.glob(os.path.join(frame_dir, "*.png")):
             os.remove(f)
         for f in glob.glob(os.path.join(frame_dir, "*.py")):

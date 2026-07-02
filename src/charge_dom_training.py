@@ -43,11 +43,16 @@ from transformers.models.esm.modeling_esmfold import (
 )
 from transformers.utils import ContextManagers
 
+from src.utils.model_utils import load_esmfold
+
 
 # ============================================================================
 # CONSTANTS
 # ============================================================================
 
+# Categorical side-chain charge at physiological pH: K/R/H are basic (+1; H's imidazole
+# pKa ~6 means it's only partially protonated at pH 7.4, but is conventionally grouped as
+# positive here), D/E are acidic (-1), everything else is treated as neutral (0).
 AA_CHARGE = {
     'K': +1, 'R': +1, 'H': +1,
     'D': -1, 'E': -1,
@@ -55,10 +60,12 @@ AA_CHARGE = {
     'N': 0, 'P': 0, 'Q': 0, 'S': 0, 'T': 0, 'V': 0, 'W': 0, 'Y': 0,
 }
 
+# The 20 canonical amino acids; AA_TO_IDX is used to validate/filter sequences (reject any
+# containing non-standard residue codes like X/B/Z/U).
 AA_LIST = list("ACDEFGHIKLMNPQRSTVWY")
 AA_TO_IDX = {aa: i for i, aa in enumerate(AA_LIST)}
 
-NUM_BLOCKS = 48
+NUM_BLOCKS = 48  # Depth of ESMFold's folding trunk (TrunkConfig.num_blocks); one DoM direction is trained per block
 
 
 # ============================================================================
@@ -84,21 +91,24 @@ class ChargeDirections:
 
 def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
     """Standard forward pass collecting sequence representations."""
+    # This is a copy of transformers' EsmFoldingTrunk.forward, monkey-patched onto the trunk
+    # instance (see collect_representations_for_sequence) so it can capture the per-block s
+    # activations (s_list) that the original HF implementation does not expose.
     device = seq_feats.device
-    s_s_0, s_z_0 = seq_feats, pair_feats
+    s_s_0, s_z_0 = seq_feats, pair_feats  # s_s_0: [B, L, 1024] sequence repr; s_z_0: [B, L, L, 128] pairwise repr
 
     if no_recycles is None:
         no_recycles = self.config.max_recycles
     else:
-        no_recycles = no_recycles + 1
+        no_recycles = no_recycles + 1  # +1 because the first pass counts as recycle iteration 0
 
     def trunk_iter(s, z, residx, mask):
-        z = z + self.pairwise_positional_embedding(residx, mask=mask)
+        z = z + self.pairwise_positional_embedding(residx, mask=mask)  # add relative sequence-position bias
 
         s_list = []
         for block in self.blocks:
             s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
-            s_list.append(s.detach().clone())
+            s_list.append(s.detach().clone())  # stash a detached copy of s after each of the 48 blocks
         return s, z, s_list
 
     s_s, s_z = s_s_0, s_z_0
@@ -107,7 +117,11 @@ def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, n
     recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
 
     for recycle_idx in range(no_recycles):
+        # Gradients are only needed on the final recycle iteration (matches upstream HF behavior);
+        # earlier iterations just refine s/z/coords without being part of the backward graph.
         with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
+            # Recycling: normalize last iteration's s/z and feed back in as an additive residual,
+            # plus a discretized inter-residue distance histogram (distogram) from predicted coords.
             recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
             recycle_z = self.recycle_z_norm(recycle_z.detach()).to(device)
             recycle_z += self.recycle_disto(recycle_bins.detach()).to(device)
@@ -122,13 +136,15 @@ def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, n
             )
 
             recycle_s, recycle_z = s_s, s_z
+            # Bin predicted CB-CB distances (from the final IPA iteration, 3.375-21.375 Å range)
+            # into self.recycle_bins buckets to feed into the next recycle round.
             recycle_bins = EsmFoldingTrunk.distogram(
                 structure["positions"][-1][:, :, :3], 3.375, 21.375, self.recycle_bins,
             )
 
     structure["s_s"] = s_s
     structure["s_z"] = s_z
-    structure["s_list"] = s_list
+    structure["s_list"] = s_list  # 48 per-block sequence reprs (each [B, L, 1024]) from the LAST recycle iteration
     structure["aatype"] = true_aa
     return structure
 
@@ -136,6 +152,9 @@ def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, n
 def baseline_forward(self, input_ids, attention_mask=None, position_ids=None,
                      masking_pattern=None, num_recycles=None, **kwargs):
     """Baseline forward pass."""
+    # Copy of EsmForProteinFolding.forward (up to the trunk call), monkey-patched onto the
+    # model instance alongside baseline_forward_trunk so both halves of the pipeline are
+    # instrumented consistently (see collect_representations_for_sequence).
     cfg = self.config.esmfold_config
     aa = input_ids
     B, L = aa.shape
@@ -146,16 +165,17 @@ def baseline_forward(self, input_ids, attention_mask=None, position_ids=None,
     if position_ids is None:
         position_ids = torch.arange(L, device=device).expand_as(input_ids)
 
-    esmaa = self.af2_idx_to_esm_idx(aa, attention_mask)
-    esm_s = self.compute_language_model_representations(esmaa)
-    esm_s = esm_s.to(self.esm_s_combine.dtype).detach()
+    esmaa = self.af2_idx_to_esm_idx(aa, attention_mask)  # remap AF2 vocab ids -> ESM-2's own vocab ids
+    esm_s = self.compute_language_model_representations(esmaa)  # run ESM-2 encoder; stacks all layer hidden states
+    esm_s = esm_s.to(self.esm_s_combine.dtype).detach()  # cast to fp32, detach (ESM-2 backbone is frozen here)
+    # Learned softmax-weighted sum across ESM-2's layers -> single [B, L, esm_hidden_dim] representation
     esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2)
 
-    s_s_0 = self.esm_s_mlp(esm_s)
-    s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)
+    s_s_0 = self.esm_s_mlp(esm_s)  # project ESM-2 hidden dim -> trunk's sequence_state_dim (1024)
+    s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)  # pairwise repr starts at zero, shape [B, L, L, 128]
 
     if self.config.esmfold_config.embed_aa:
-        s_s_0 += self.embedding(aa)
+        s_s_0 += self.embedding(aa)  # optionally add a learned per-residue-identity embedding
 
     return self.trunk(s_s_0, s_z_0, aa, position_ids, attention_mask, no_recycles=num_recycles)
 
@@ -168,21 +188,27 @@ def collect_representations_for_sequence(
     model, seq: str, tokenizer, device: str
 ) -> Dict[str, List[torch.Tensor]]:
     """Collect s representations for a sequence."""
+    # Monkey-patch the instrumented forward functions onto this model instance right before
+    # use (types.MethodType binds them as bound methods so `self` resolves correctly). No
+    # explicit "unpatch" step is needed: every call re-assigns these attributes beforehand.
     model.forward = types.MethodType(baseline_forward, model)
     model.trunk.forward = types.MethodType(baseline_forward_trunk, model.trunk)
 
     with torch.no_grad():
+        # add_special_tokens=False: ESMFold's own tokenizer wraps the AF2 vocab; BOS/EOS are
+        # added internally inside compute_language_model_representations, so adding them here
+        # too would double them up.
         inputs = tokenizer(seq, return_tensors='pt', add_special_tokens=False).to(device)
-        outputs = model(**inputs, num_recycles=0)
+        outputs = model(**inputs, num_recycles=0)  # single pass (no iterative recycling) - just need s_list
 
     return {
-        's_list': [s.cpu() for s in outputs['s_list']],
+        's_list': [s.cpu() for s in outputs['s_list']],  # move to CPU to free GPU memory across many sequences
     }
 
 
 def compute_charge_labels(seq: str) -> List[int]:
     """Get charge labels for each residue: +1, -1, or 0."""
-    return [AA_CHARGE.get(aa, 0) for aa in seq]
+    return [AA_CHARGE.get(aa, 0) for aa in seq]  # unknown/non-standard residues default to neutral (0)
 
 
 # ============================================================================
@@ -215,23 +241,25 @@ def train_dom_vectors(
     print(f"\nTraining DoM vectors on {len(sequences)} sequences...")
 
     # Collect representations grouped by charge
+    # Accumulators pool residue-level activation vectors across ALL sequences (not per-sequence
+    # means) before computing the block-wise mean; one list per trunk block per charge sign.
     s_positive = {block: [] for block in blocks_to_train}
     s_negative = {block: [] for block in blocks_to_train}
 
     for seq in tqdm(sequences, desc="Collecting representations"):
         if not all(aa in AA_TO_IDX for aa in seq):
-            continue
+            continue  # skip sequences containing non-standard residue codes (X, B, Z, U, ...)
 
         try:
             data = collect_representations_for_sequence(model, seq, tokenizer, device)
         except Exception as e:
             print(f"Error processing sequence: {e}")
-            continue
+            continue  # don't let one bad sequence abort DoM collection over the whole dataset
 
         charges = compute_charge_labels(seq)
 
         for block in blocks_to_train:
-            s = data['s_list'][block][0]  # [L, dim]
+            s = data['s_list'][block][0]  # [L, dim]; index 0 drops the batch dim (batch size is always 1 here)
 
             # Collect s representations by charge
             for i, charge in enumerate(charges):
@@ -239,9 +267,10 @@ def train_dom_vectors(
                     s_positive[block].append(s[i].numpy())
                 elif charge < 0:
                     s_negative[block].append(s[i].numpy())
+                # neutral residues (charge == 0) are not used for DoM training
 
         del data
-        torch.cuda.empty_cache()
+        torch.cuda.empty_cache()  # free GPU memory aggressively; this loop runs over many sequences
 
     # Compute DoM vectors
     print("\nComputing DoM vectors...")
@@ -254,13 +283,21 @@ def train_dom_vectors(
         if len(s_positive[block]) > 0 and len(s_negative[block]) > 0:
             s_pos_mean = np.mean(s_positive[block], axis=0)
             s_neg_mean = np.mean(s_negative[block], axis=0)
-            s_dir = s_pos_mean - s_neg_mean
+            s_dir = s_pos_mean - s_neg_mean  # the Difference-of-Means (DoM) direction itself
+            # Unit-normalize (1e-8 epsilon avoids divide-by-zero for a degenerate direction) so
+            # the `magnitude` parameter used later in charge_steering.py is comparable across blocks.
             s_dir = s_dir / (np.linalg.norm(s_dir) + 1e-8)
             s_directions[block] = s_dir
 
             # Compute std for scaling
+            # Project ALL pooled residues (both charges) onto the direction and take the std of
+            # those projections. This per-block scalar becomes the unit for `magnitude` in
+            # charge_steering.py ("N standard deviations along the charge direction"), correcting
+            # for the fact that raw activation scale differs a lot from block to block.
             all_s = np.concatenate([s_positive[block], s_negative[block]], axis=0)
             s_stds[block] = np.std(all_s @ s_dir)
+        # blocks with no positive or no negative examples are silently skipped, so s_directions
+        # can end up with fewer entries than len(blocks_to_train)
 
     print(f"Trained directions for {len(s_directions)} blocks")
 
@@ -292,6 +329,8 @@ def evaluate_dom_vectors(
     print(f"\nEvaluating DoM vectors on {len(sequences)} sequences...")
 
     # Collect projections
+    # Scalar projection of each residue's s vector onto its block's trained DoM direction, plus
+    # the residue's charge label; measures how well the direction generalizes to held-out data.
     s_projections = {block: [] for block in blocks_to_eval}
     s_charges = {block: [] for block in blocks_to_eval}
 
@@ -308,14 +347,14 @@ def evaluate_dom_vectors(
 
         for block in blocks_to_eval:
             if block not in directions.s_directions:
-                continue
+                continue  # this block had no trained direction (e.g. no charged residues seen during training)
 
             s = data['s_list'][block][0].numpy()
             s_dir = directions.s_directions[block]
 
             # s projections: project each residue onto direction
             for i, charge in enumerate(charges):
-                if charge != 0:
+                if charge != 0:  # only compare charged residues, matching how the direction was trained
                     proj = np.dot(s[i], s_dir)
                     s_projections[block].append(proj)
                     s_charges[block].append(charge)
@@ -342,9 +381,11 @@ def evaluate_dom_vectors(
                 separation = pos_mean - neg_mean
 
                 # Cohen's d
+                # (standardized effect size = mean difference / pooled std, so separation
+                # strength can be compared across blocks with different activation scales)
                 pos_std = s_projs[pos_mask].std()
                 neg_std = s_projs[neg_mask].std()
-                pooled_std = np.sqrt((pos_std**2 + neg_std**2) / 2)
+                pooled_std = np.sqrt((pos_std**2 + neg_std**2) / 2)  # average of the two group variances
                 cohens_d = separation / pooled_std if pooled_std > 0 else 0
 
                 results.append({
@@ -391,6 +432,7 @@ def plot_dom_evaluation(eval_df: pd.DataFrame, output_dir: str):
     ax.plot(eval_df['block'], eval_df['cohens_d'], 'o-',
             color='#3498db', linewidth=2, markersize=5)
     ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    # 0.8 is the conventional Cohen's-d threshold for a "large" effect size (0.2/0.5/0.8 = small/medium/large)
     ax.axhline(y=0.8, color='gray', linestyle=':', alpha=0.5, label='Large effect (0.8)')
     ax.set_xlabel('Block', fontsize=12)
     ax.set_ylabel("Cohen's d", fontsize=12)
@@ -411,10 +453,12 @@ def plot_projection_histograms(
 ):
     """Plot centered projection histograms for selected blocks."""
     n_blocks = len(blocks_to_show)
-    n_cols = min(4, n_blocks)
-    n_rows = (n_blocks + n_cols - 1) // n_cols
+    n_cols = min(4, n_blocks)  # cap grid width at 4 columns
+    n_rows = (n_blocks + n_cols - 1) // n_cols  # ceiling division to fit all blocks
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
+    # plt.subplots returns a bare Axes for a 1x1 grid, a 1-D array if either dimension is 1, and
+    # a 2-D array otherwise; normalize all cases to a flat 1-D array for uniform axes[ax_idx] indexing below.
     if n_rows == 1 and n_cols == 1:
         axes = np.array([[axes]])
     elif n_rows == 1:
@@ -443,7 +487,7 @@ def plot_projection_histograms(
         overall_mean = projs.mean()
         projs_centered = projs - overall_mean
 
-        bins = np.linspace(projs_centered.min(), projs_centered.max(), 40)
+        bins = np.linspace(projs_centered.min(), projs_centered.max(), 40)  # shared bin edges so pos/neg histograms are directly comparable
 
         ax.hist(projs_centered[pos_mask], bins=bins, alpha=0.7,
                 color='#3498db', density=True, label=f'Positive (n={pos_mask.sum()})')
@@ -463,6 +507,7 @@ def plot_projection_histograms(
             ax.legend(fontsize=8)
 
     # Hide unused axes
+    # (grid may have more cells than blocks_to_show entries)
     for idx in range(len(blocks_to_show), len(axes)):
         axes[idx].set_visible(False)
 
@@ -489,6 +534,8 @@ def save_directions(directions: ChargeDirections, path: str):
 
 def load_directions(path: str) -> ChargeDirections:
     """Load DoM directions from file."""
+    # weights_only=False: the checkpoint holds plain dicts of numpy arrays/floats (not just
+    # tensors), which torch.load's safer weights_only=True default would refuse to unpickle.
     data = torch.load(path, weights_only=False)
     return ChargeDirections(
         s_directions=data['s_directions'],
@@ -501,6 +548,7 @@ def load_directions(path: str) -> ChargeDirections:
 # ============================================================================
 
 def parse_args():
+    """Parse command-line arguments for DoM charge-direction training."""
     parser = argparse.ArgumentParser(
         description='Train charge direction (DoM) vectors for ESMFold steering',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -519,6 +567,7 @@ def parse_args():
 
 
 def main():
+    """CLI entry point: train DoM charge directions, then evaluate them on a held-out test split."""
     args = parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -529,9 +578,7 @@ def main():
     print(f"Using device: {device}")
 
     # Load model
-    print("\nLoading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    model, tokenizer = load_esmfold(device)
 
     blocks_to_use = args.blocks
 
@@ -553,6 +600,9 @@ def main():
     print("PHASE 1: TRAIN DoM VECTORS")
     print("="*60)
 
+    # Restrict training data to alpha_helical sequences: charge_steering.py's interventions are
+    # applied to helical (non-hairpin) sequences, so training on the same population keeps the
+    # learned direction's statistics representative of the eventual intervention target domain.
     train_df = probing_df[
         (probing_df['split'] == 'train') &
         (probing_df['structure_type'] == 'alpha_helical')
@@ -592,6 +642,8 @@ def main():
     print("PHASE 2: EVALUATE DoM VECTORS")
     print("="*60)
 
+    # Unlike training, evaluation uses the ENTIRE test split (all structure_types, not just
+    # alpha_helical) to check how well the direction generalizes beyond the training population.
     test_df = probing_df[probing_df['split'] == 'test']
 
     seq_col = 'FullChainSequence' if 'FullChainSequence' in test_df.columns else 'sequence'

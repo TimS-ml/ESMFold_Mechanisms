@@ -15,13 +15,17 @@ import matplotlib.pyplot as plt
 
 # Load the stats
 OUTPUT_DIR = "information_flow_donor_simplified"
-stats_df = pd.read_parquet(f'{OUTPUT_DIR}/stats.parquet')
+stats_df = pd.read_parquet(f'{OUTPUT_DIR}/stats.parquet')  # per-case, per-block info-flow metrics produced upstream by the information-flow analysis pipeline
 
 # Get the data (no smoothing - show raw results)
+# Average each relative info-flow metric across all cases, per block, giving one scalar per block (0-47)
 pair2seq_h = stats_df.groupby('block')['pair2seq_relative_hairpin'].mean()
 seq2pair_h = stats_df.groupby('block')['seq2pair_relative_hairpin'].mean()
 
 # Normalize to 0-1
+# Each series is min-max scaled independently, so the plot shows each curve's own relative
+# shape/trend across blocks rather than the two curves' absolute magnitudes relative to each
+# other. +1e-10 avoids a division-by-zero if a series were ever constant (max == min).
 pair2seq_scaled = (pair2seq_h - pair2seq_h.min()) / (pair2seq_h.max() - pair2seq_h.min() + 1e-10)
 seq2pair_scaled = (seq2pair_h - seq2pair_h.min()) / (seq2pair_h.max() - seq2pair_h.min() + 1e-10)
 
@@ -46,6 +50,7 @@ ax.plot(seq2pair_scaled.index, seq2pair_scaled.values,
         color=orange, linewidth=2.5)
 
 # Add regime boundaries
+# (disabled) would mark block 15 and block 35 as boundaries between early/middle/late trunk regimes
 # ax.axvline(x=15, color='gray', linestyle='--', alpha=0.4, linewidth=1.5)
 # ax.axvline(x=35, color='gray', linestyle='--', alpha=0.4, linewidth=1.5)
 
@@ -78,10 +83,11 @@ ax.legend(
 ax.grid(alpha=0.3, linewidth=1)
 
 # Set limits
-ax.set_xlim(0, 47)
-ax.set_ylim(0, 1.05)
+ax.set_xlim(0, 47)  # 47 = index of the last of the 48 (0-indexed) trunk blocks
+ax.set_ylim(0, 1.05)  # slight headroom above the normalized [0, 1] range so curves/legend aren't clipped at the top edge
 
 plt.tight_layout()
+# Save both a raster (.png, for quick viewing) and vector (.pdf, for publication) copy of the same figure
 plt.savefig(f'{OUTPUT_DIR}/info_flow_hairpin_custom.png', dpi=150, bbox_inches='tight')
 plt.savefig(f'{OUTPUT_DIR}/info_flow_hairpin_custom.pdf', bbox_inches='tight')
 plt.close()

@@ -26,18 +26,20 @@ def compute_rg_from_pdb(pdb_path):
     try:
         with open(pdb_path, "r") as f:
             for line in f:
+                # Fixed-column PDB ATOM record format: cols 12:16 = atom name,
+                # 30:38/38:46/46:54 = x/y/z coordinate fields (0-indexed slices).
                 if line.startswith("ATOM") and line[12:16].strip() == "CA":
                     x = float(line[30:38])
                     y = float(line[38:46])
                     z = float(line[46:54])
                     ca_coords.append([x, y, z])
     except Exception:
-        return np.nan
+        return np.nan  # unreadable/malformed PDB -> caller treats this as "no Rg data"
     if len(ca_coords) < 3:
-        return np.nan
+        return np.nan  # need at least 3 points for a meaningful center/spread
     coords = np.array(ca_coords)
     center = coords.mean(axis=0)
-    return np.sqrt(np.mean(np.sum((coords - center) ** 2, axis=1)))
+    return np.sqrt(np.mean(np.sum((coords - center) ** 2, axis=1)))  # classic radius-of-gyration formula
 
 
 def add_rg_to_pdb_index(pdb_index, pdb_root):
@@ -51,9 +53,9 @@ def add_rg_to_pdb_index(pdb_index, pdb_root):
         if np.isnan(rg):
             n_missing += 1
         rg_values.append(rg)
-        if (i + 1) % 500 == 0:
+        if (i + 1) % 500 == 0:  # periodic progress heartbeat (arbitrary interval)
             print(f"    {i+1}/{len(pdb_index)} done")
-    pdb_index = pdb_index.copy()
+    pdb_index = pdb_index.copy()  # avoid mutating the caller's dataframe in place
     pdb_index["rg"] = rg_values
     print(f"  Done. {n_missing} PDBs could not be read.")
     return pdb_index
@@ -74,15 +76,18 @@ def load_and_filter(args):
     print(f"  {len(pdb_idx)} rows, {pdb_idx['case_idx'].nunique()} cases")
 
     if "rg" in pdb_idx.columns and args.skip_rg_compute:
-        print("  Using cached Rg values")
+        print("  Using cached Rg values")  # reuse Rg already computed by a previous run instead of re-parsing every PDB
     else:
         pdb_idx = add_rg_to_pdb_index(pdb_idx, args.pdb_root)
 
     bl_pdb = pdb_idx[pdb_idx["block_set"] == "baseline"]
     iv_pdb = pdb_idx[pdb_idx["block_set"] != "baseline"]
-    bl_rg = bl_pdb.groupby("case_idx")["rg"].mean().rename("baseline_rg")
+    bl_rg = bl_pdb.groupby("case_idx")["rg"].mean().rename("baseline_rg")  # one baseline Rg per case_idx
 
     # Aggregate quality per (case_idx, window_start)
+    # Note: this pools Rg across any window_size/magnitude/polarity variation present in
+    # pdb_idx for a given (case_idx, window_start), so the resulting rg_ratio merged onto df
+    # below is applied at window_start granularity, not per exact intervention configuration.
     quality = iv_pdb.groupby(["case_idx", "window_start"]).agg(
         rg=("rg", "mean"),
     ).reset_index()
@@ -95,10 +100,10 @@ def load_and_filter(args):
     )
 
     # Zero out hbond% for interventions that fail Rg or have no Rg data
-    df_filtered = df_merged.copy()
+    df_filtered = df_merged.copy()  # avoid mutating df_merged when assigning below
     is_iv = df_filtered["block_set"] != "baseline"
-    has_rg = df_filtered["rg_ratio"].notna()
-    fails_rg = df_filtered["rg_ratio"] < args.rg_ratio_threshold
+    has_rg = df_filtered["rg_ratio"].notna()  # rows that couldn't be matched to a pdb_index entry
+    fails_rg = df_filtered["rg_ratio"] < args.rg_ratio_threshold  # structure likely collapsed relative to baseline
     zero_mask = is_iv & (~has_rg | fails_rg)
     df_filtered.loc[zero_mask, "hbond_percentage"] = 0.0
 
@@ -121,17 +126,20 @@ def plot_hbond_curve(df, label, color, ax, polarity=None):
         iv = iv[iv["polarity"] == polarity]
     grp = iv.groupby("window_start")["hbond_percentage"]
     means = grp.mean().sort_index()
-    sems = grp.sem().fillna(0).reindex(means.index)
+    sems = grp.sem().fillna(0).reindex(means.index)  # .sem() is NaN for single-sample groups; treat as zero error
 
-    ax.fill_between(means.index, means.values, color=color, alpha=0.3)
+    ax.fill_between(means.index, means.values, color=color, alpha=0.3)  # shaded area under the curve, purely stylistic
     ax.plot(means.index, means.values, color=color, linewidth=2.5,
             marker="o", markersize=5, label=label)
     # SEM as thin error bars
+    # (fmt="none": draw only the error bars here, since the line/markers are already drawn above)
     ax.errorbar(means.index, means.values, yerr=sems.values,
                 fmt="none", ecolor=color, alpha=0.5, capsize=2, lw=1)
 
 
 def main():
+    """CLI entry point: load results + Rg data, apply the Rg quality filter, and save two plots
+    (raw-vs-filtered overlay, and a filtered-only presentation version)."""
     parser = argparse.ArgumentParser(
         description="Plot H-bond formation with Rg quality filter")
     parser.add_argument("--parquet",
@@ -165,7 +173,7 @@ def main():
     # Plot: raw vs Rg-filtered overlay
     # ==========================================================================
     fig, ax = plt.subplots(figsize=FIGSIZE)
-    fig.subplots_adjust(left=0.15, top=0.70, right=0.95, bottom=0.35)
+    fig.subplots_adjust(left=0.15, top=0.70, right=0.95, bottom=0.35)  # wide margins to fit the large FONT_SIZE labels
 
     if INTERVENTION_WINDOW is not None:
         ax.axvspan(INTERVENTION_WINDOW[0], INTERVENTION_WINDOW[1],
@@ -182,9 +190,9 @@ def main():
 
     ax.set_xlabel("Window Start Block", fontsize=FONT_SIZE)
     ax.set_ylabel("H-bond Formation (%)", fontsize=FONT_SIZE)
-    ax.set_xlim(0, 34)
+    ax.set_xlim(0, 34)  # covers window_start range for a window_size=15 sweep over 48 blocks (max start = 48-15 = 33), plus padding
     ax.tick_params(axis="both", labelsize=FONT_SIZE, width=1.5, length=6)
-    ax.legend(loc="upper right", fontsize=FONT_SIZE * 0.6, frameon=True)
+    ax.legend(loc="upper right", fontsize=FONT_SIZE * 0.6, frameon=True)  # smaller than axis labels so the legend box fits
 
     ax.spines["left"].set_linewidth(1.5)
     ax.spines["bottom"].set_linewidth(1.5)
@@ -211,7 +219,7 @@ def main():
 
     plot_hbond_curve(df_filtered, "H-bond\n(N-O < 3.5Å)", COLOR_FILTERED, ax)
 
-    ax.axhline(bl_mean, color="gray", ls="--", lw=1.5, alpha=0.5)
+    ax.axhline(bl_mean, color="gray", ls="--", lw=1.5, alpha=0.5)  # reuses bl_mean computed for the first plot above
 
     ax.set_xlabel("Window Start Block", fontsize=FONT_SIZE)
     ax.set_ylabel("H-bond Formation (%)", fontsize=FONT_SIZE)
@@ -219,7 +227,7 @@ def main():
     ax.tick_params(axis="both", labelsize=FONT_SIZE, width=1.5, length=6)
     from matplotlib.ticker import FuncFormatter
 
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.0f}"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.0f}"))  # force whole-number y-tick labels (no decimals)
     ax.legend(loc="upper right", fontsize=FONT_SIZE, frameon=True)
 
     ax.spines["left"].set_linewidth(1.5)

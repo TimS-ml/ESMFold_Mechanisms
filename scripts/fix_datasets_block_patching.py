@@ -1,5 +1,9 @@
+# Build a small, balanced CSV of "successful" single-block patching interventions
+# (patching either the sequence or pairwise representation at one trunk block causes
+# the hairpin to still be found) for closer downstream inspection/plotting.
 import pandas as pd
 
+# Source parquet from a prior full patching sweep (raw experiment output, not checked in)
 df = pd.read_parquet("/share/NFS/u/kevin/ProteinFolding-1/data_old/block_patching_results.parquet")
 
 print(df)
@@ -8,6 +12,7 @@ import pandas as pd
 import pandas as pd
 
 # Define the filter conditions
+# Early-block sequence-representation patch (block_idx 0) that still finds the hairpin
 sequence_block0_mask = (
     (df['patch_mode'] == 'sequence') & 
     (df['patch_mask_mode'] == 'intra') & 
@@ -15,6 +20,7 @@ sequence_block0_mask = (
     (df['block_idx'] == 0)
 )
 
+# Later-block pairwise-representation patch (block_idx 30) that still finds the hairpin
 pairwise_block30_mask = (
     (df['patch_mode'] == 'pairwise') & 
     (df['patch_mask_mode'] == 'intra') & 
@@ -26,10 +32,12 @@ pairwise_block30_mask = (
 print(f"Sequence block 0 population: {sequence_block0_mask.sum()}")
 print(f"Pairwise block 30 population: {pairwise_block30_mask.sum()}")
 
+# Fixed random_state=42 for reproducibility; 400/200 are fixed target sample sizes
 # Sample from each population
 sequence_block0 = df[sequence_block0_mask].sample(n=400, random_state=42)
 pairwise_block30 = df[pairwise_block30_mask].sample(n=200, random_state=42)
 
+# Result gets a fresh 0..N contiguous index via reset_index below
 # Combine into single dataset
 single_block_patching_successes = pd.concat([
     sequence_block0,
@@ -41,4 +49,7 @@ print(f"\nTotal rows: {len(single_block_patching_successes)}")
 print(f"Sequence block 0 rows: {len(sequence_block0)}")
 print(f"Pairwise block 30 rows: {len(pairwise_block30)}")
 
+# NOTE: possible bug -- missing index=False (inconsistent with the other fix_datasets_*.py
+# scripts in this directory), so the DataFrame's RangeIndex will be written as an extra
+# unnamed leading column in the CSV.
 single_block_patching_successes.to_csv("data/single_block_patching_successes.csv")

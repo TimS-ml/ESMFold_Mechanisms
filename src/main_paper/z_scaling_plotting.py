@@ -54,9 +54,15 @@ def plot_z_vs_s_scaling(
     fig, ax = plt.subplots(figsize=figsize)
     
     # Compute change from baseline (scale=1.0) for each case
+    # (each case is centered on its OWN scale=1.0 baseline, not a single global baseline - needed
+    # since different cases are different protein sequences whose absolute metric values can
+    # differ substantially; this makes deltas comparable/poolable across cases)
     # For z results
     z_baseline = z_df[z_df['scale'] == 1.0].set_index('case_idx')[metric]
     z_df = z_df.copy()
+    # Row-wise apply (axis=1) since we need both this row's case_idx and its metric value at
+    # once; .get(..., row[metric]) defensively falls back to delta=0 if a case's own baseline
+    # row is somehow missing, instead of raising a KeyError.
     z_df['delta'] = z_df.apply(lambda row: row[metric] - z_baseline.get(row['case_idx'], row[metric]), axis=1)
     
     # For s results
@@ -65,6 +71,9 @@ def plot_z_vs_s_scaling(
     s_df['delta'] = s_df.apply(lambda row: row[metric] - s_baseline.get(row['case_idx'], row[metric]), axis=1)
     
     # Group by scale and compute mean and std of delta
+    # (pools the per-case, baseline-centered deltas across ALL cases at each scale value;
+    # reset_index() turns the 'scale' groupby key back into a plain column for the positional
+    # .values access used below)
     z_grouped = z_df.groupby('scale')['delta'].agg(['mean', 'std']).reset_index()
     s_grouped = s_df.groupby('scale')['delta'].agg(['mean', 'std']).reset_index()
     
@@ -88,10 +97,13 @@ def plot_z_vs_s_scaling(
                     color=s_color, alpha=0.2)
     
     # Add interpolated marker at scale=1.75
+    # (1.75 is the midpoint of the 1.5-2.0 gap, which - unlike the rest of the default scale
+    # grid, spaced by 0.25 - is a wider 0.5 step; this linearly-interpolated point is purely a
+    # cosmetic visual aid to fill that gap, not an actually-computed data point)
     if 1.5 in scales_z and 2.0 in scales_z:
         idx_15 = np.where(scales_z == 1.5)[0][0]
         idx_20 = np.where(scales_z == 2.0)[0][0]
-        z_interp = z_mean[idx_15] + (z_mean[idx_20] - z_mean[idx_15]) * 0.5
+        z_interp = z_mean[idx_15] + (z_mean[idx_20] - z_mean[idx_15]) * 0.5  # linear interpolation, halfway
         ax.plot(1.75, z_interp, 'o', color=z_color, markersize=8, zorder=5)
     
     if 1.5 in scales_s and 2.0 in scales_s:
@@ -125,6 +137,7 @@ def plot_z_vs_s_scaling(
 
 
 def main():
+    """CLI entry point: load z/s scaling result CSVs, plot the comparison, and print a summary."""
     parser = argparse.ArgumentParser(description='Plot z vs s scaling results')
     parser.add_argument('--z_csv', type=str, default='z_vs_s_scaling/z_scaling_results.csv',
                         help='Path to z_scaling_results.csv')
@@ -158,6 +171,8 @@ def main():
     
     # Set output path
     if args.output is None:
+        # os.path.dirname returns '' if z_csv is a bare filename with no directory component;
+        # `or '.'` falls back to the current directory in that case.
         output_dir = os.path.dirname(args.z_csv) or '.'
         args.output = os.path.join(output_dir, f'z_vs_s_{args.metric}.png')
     
@@ -177,6 +192,9 @@ def main():
     print("="*50)
     
     # Compute deltas for summary
+    # (repeats the same per-case-baseline-centered delta computation as plot_z_vs_s_scaling
+    # above, since that function only returns the fig object, not its intermediate delta/grouped
+    # values - recomputed here just to print the Z/S range comparison as text)
     z_baseline = z_df[z_df['scale'] == 1.0].set_index('case_idx')[args.metric]
     z_df_copy = z_df.copy()
     z_df_copy['delta'] = z_df_copy.apply(lambda row: row[args.metric] - z_baseline.get(row['case_idx'], row[args.metric]), axis=1)

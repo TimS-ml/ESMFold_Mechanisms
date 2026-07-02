@@ -32,7 +32,7 @@ from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
+import torch.nn as nn  # unused in this file (leftover import)
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -42,19 +42,27 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from sklearn.model_selection import train_test_split
 
 from transformers import EsmForProteinFolding, AutoTokenizer
+# EsmFoldingTrunk is used below for its static `distogram` helper when replicating the
+# trunk's forward pass; categorical_lddt, EsmForProteinFoldingOutput, and make_atom14_masks
+# (this import and the one below) are unused in this file (leftover imports).
 from transformers.models.esm.modeling_esmfold import (
     categorical_lddt,
     EsmFoldingTrunk,
     EsmForProteinFoldingOutput
 )
 from transformers.models.esm.openfold_utils import make_atom14_masks
-from transformers.utils import ContextManagers
+
+from src.utils.model_utils import load_esmfold  # shared ESMFold + tokenizer loader
+from transformers.utils import ContextManagers  # wraps recycle iterations in torch.no_grad() except the last
 
 
 # ============================================================================
 # CONSTANTS
 # ============================================================================
 
+# Side-chain charge classification used both as probe labels and to decide which
+# residues get +delta / -delta during intervention: K/R/H (lysine, arginine, histidine)
+# are treated as positive, D/E (aspartate, glutamate) as negative, everything else neutral.
 AA_CHARGE = {
     'K': +1, 'R': +1, 'H': +1,
     'D': -1, 'E': -1,
@@ -62,7 +70,7 @@ AA_CHARGE = {
     'N': 0, 'P': 0, 'Q': 0, 'S': 0, 'T': 0, 'V': 0, 'W': 0, 'Y': 0,
 }
 
-NUM_BLOCKS = 48
+NUM_BLOCKS = 48  # number of blocks in ESMFold's folding trunk; unused in this file (kept for consistency with sibling scripts)
 
 
 # ============================================================================
@@ -72,12 +80,12 @@ NUM_BLOCKS = 48
 @dataclass
 class ChargeDirections:
     """Cached charge directions for all blocks."""
-    s_directions: Dict[int, np.ndarray]
-    seq2pair_directions: Dict[int, np.ndarray]
-    z_directions: Dict[int, np.ndarray]
-    s_stds: Dict[int, float]
-    seq2pair_stds: Dict[int, float]
-    z_stds: Dict[int, float]
+    s_directions: Dict[int, np.ndarray]  # block_idx -> DoM charge direction in sequence repr `s`
+    seq2pair_directions: Dict[int, np.ndarray]  # block_idx -> DoM charge direction in seq2pair repr
+    z_directions: Dict[int, np.ndarray]  # block_idx -> DoM charge direction in pairwise repr `z`
+    s_stds: Dict[int, float]  # block_idx -> std of `s` projections onto its direction (scales intervention magnitude)
+    seq2pair_stds: Dict[int, float]  # block_idx -> std of seq2pair projections onto its direction
+    z_stds: Dict[int, float]  # block_idx -> std of `z` projections onto its direction
 
 
 @dataclass 
@@ -99,7 +107,7 @@ class HairpinTopology:
     turn_end: int
     strand2_start: int
     strand2_end: int
-    cross_strand_pairs: List[Tuple[int, int]]
+    cross_strand_pairs: List[Tuple[int, int]]  # (i, j) residue pairs expected to face each other across the two strands in an idealized antiparallel hairpin
 
 
 # ============================================================================
@@ -108,23 +116,32 @@ class HairpinTopology:
 
 def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
     """Standard forward pass collecting representations."""
+    # Monkey-patched in place of EsmFoldingTrunk.forward (via types.MethodType) so we can
+    # additionally capture per-block s/z/seq2pair tensors, which the original implementation
+    # discards. Control flow below otherwise mirrors the original trunk forward exactly.
     device = seq_feats.device
-    s_s_0, s_z_0 = seq_feats, pair_feats
+    s_s_0, s_z_0 = seq_feats, pair_feats  # keep the pre-recycle inputs around; each recycle iter re-adds these
 
     if no_recycles is None:
         no_recycles = self.config.max_recycles
     else:
-        no_recycles = no_recycles + 1
+        no_recycles = no_recycles + 1  # the "+1" accounts for the initial pass counting as the first recycle
 
     def trunk_iter(s, z, residx, mask):
+        # relative positional bias added to the pairwise state once per trunk_iter call (not per block)
         z = z + self.pairwise_positional_embedding(residx, mask=mask)
         
         s_list, z_list, seq2pair_list = [], [], []
-        for block in self.blocks:
+        for block in self.blocks:  # iterate over the 48 EsmFoldTriangularSelfAttentionBlock modules
+            # Capture the block's sequence->pair projection (its internal EsmFoldSequenceToPair
+            # submodule) applied to the pre-block, layernorm'd `s`, as a proxy readout of what
+            # pairwise-charge signal `s` would induce at this point -- used later for seq2pair probing.
             seq2pair_out = block.sequence_to_pair(block.layernorm_1(s))
             seq2pair_list.append(seq2pair_out.detach().clone())
             
             s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
+            # .detach().clone(): drop autograd history (no grads needed here) and store an
+            # independent snapshot of s/z at this block, since s/z are reused/reassigned below
             s_list.append(s.detach().clone())
             z_list.append(z.detach().clone())
         return s, z, s_list, z_list, seq2pair_list
@@ -132,9 +149,11 @@ def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, n
     s_s, s_z = s_s_0, s_z_0
     recycle_s = torch.zeros_like(s_s)
     recycle_z = torch.zeros_like(s_z)
-    recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
+    recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)  # per-pair distance-bin indices, initially all bin 0
 
     for recycle_idx in range(no_recycles):
+        # Only the final recycle iteration needs gradients (irrelevant here since this whole
+        # module is always called under an outer torch.no_grad() in this script, but kept for fidelity).
         with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
             recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
             recycle_z = self.recycle_z_norm(recycle_z.detach()).to(device)
@@ -150,10 +169,15 @@ def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, n
             )
             
             recycle_s, recycle_z = s_s, s_z
+            # Discretize predicted CA distances into bins to feed back as a "distogram" prior
+            # for the next recycle; 3.375 / 21.375 (Angstroms) are the same min/max bin
+            # boundaries used by AlphaFold2/ESMFold's original recycling scheme.
             recycle_bins = EsmFoldingTrunk.distogram(
                 structure["positions"][-1][:, :, :3], 3.375, 21.375, self.recycle_bins,
             )
 
+    # Stash the captured per-block representations onto the structure_module output dict so
+    # callers (e.g. get_baseline_structure) can retrieve them alongside the usual outputs.
     structure["s_s"] = s_s
     structure["s_z"] = s_z
     structure["s_list"] = s_list
@@ -166,6 +190,9 @@ def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, n
 def baseline_forward(self, input_ids, attention_mask=None, position_ids=None,
                      masking_pattern=None, num_recycles=None, **kwargs):
     """Baseline forward pass."""
+    # Monkey-patched in place of EsmForProteinFolding.forward; reproduces just the pieces
+    # needed to get from tokens to trunk inputs (s_s_0, s_z_0), then hands off to the
+    # (also monkey-patched) trunk forward for the actual representation capture.
     cfg = self.config.esmfold_config
     aa = input_ids
     B, L = aa.shape
@@ -176,16 +203,18 @@ def baseline_forward(self, input_ids, attention_mask=None, position_ids=None,
     if position_ids is None:
         position_ids = torch.arange(L, device=device).expand_as(input_ids)
 
-    esmaa = self.af2_idx_to_esm_idx(aa, attention_mask)
-    esm_s = self.compute_language_model_representations(esmaa)
-    esm_s = esm_s.to(self.esm_s_combine.dtype).detach()
-    esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2)
+    esmaa = self.af2_idx_to_esm_idx(aa, attention_mask)  # translate AF2 vocab token ids -> ESM-2 vocab ids
+    esm_s = self.compute_language_model_representations(esmaa)  # run the 36-layer ESM-2 encoder; stacked per-layer hidden states
+    esm_s = esm_s.to(self.esm_s_combine.dtype).detach()  # cast back to fp32 (see model_utils.py precision notes) and drop grad (frozen backbone)
+    # esm_s_combine: learned per-layer softmax weights that linearly combine the stack of
+    # per-layer ESM-2 hidden states into a single per-residue vector (weighted sum via matmul).
+    esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2)  # squeeze(2) drops the now-singleton "layer" dim
     
-    s_s_0 = self.esm_s_mlp(esm_s)
-    s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)
+    s_s_0 = self.esm_s_mlp(esm_s)  # project combined ESM repr into the trunk's initial sequence state
+    s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)  # pairwise state starts at all zeros; trunk builds it up from here
 
     if self.config.esmfold_config.embed_aa:
-        s_s_0 += self.embedding(aa)
+        s_s_0 += self.embedding(aa)  # optionally add a learned raw amino-acid identity embedding on top of the LM features
 
     return self.trunk(s_s_0, s_z_0, aa, position_ids, attention_mask, no_recycles=num_recycles)
 
@@ -196,6 +225,11 @@ def intervention_forward_trunk_s_only(
     s_interventions: Optional[Dict[int, torch.Tensor]] = None,
 ):
     """Forward pass with s-only interventions, returning intermediate representations."""
+    # Same monkey-patch strategy as baseline_forward_trunk, but additionally implements the
+    # causal intervention: at each block in `intervention_blocks`, add a fixed steering vector
+    # to `s` before that block runs. This tests whether pushing the *sequence* representation
+    # along a chosen charge direction causally shifts the (linearly probed) *pairwise* charge
+    # signal downstream -- as opposed to the purely correlational probing baseline_forward_trunk supports.
     device = seq_feats.device
     s_s_0, s_z_0 = seq_feats, pair_feats
 
@@ -212,9 +246,11 @@ def intervention_forward_trunk_s_only(
             # Apply s intervention before block processes it
             if block_idx in intervention_blocks and s_interventions is not None:
                 if block_idx in s_interventions:
+                    # unsqueeze(0) broadcasts the (L, C) per-residue intervention over the batch dim
                     s = s + s_interventions[block_idx].unsqueeze(0)
             
-            # Capture seq2pair AFTER intervention is applied to s
+            # Capture seq2pair AFTER intervention is applied to s, so any causal effect of the
+            # intervention on the pairwise-charge readout is visible at this same block.
             seq2pair_out = block.sequence_to_pair(block.layernorm_1(s))
             seq2pair_list.append(seq2pair_out.detach().clone())
             
@@ -266,6 +302,9 @@ def intervention_forward_s_only(
     **kwargs
 ):
     """Forward pass with s-only interventions."""
+    # Identical to baseline_forward up through building s_s_0/s_z_0; only the final
+    # trunk call differs, forwarding the intervention_blocks/s_interventions through to
+    # the (monkey-patched) intervention_forward_trunk_s_only.
     cfg = self.config.esmfold_config
     aa = input_ids
     B, L = aa.shape
@@ -296,12 +335,15 @@ def intervention_forward_s_only(
 
 def get_baseline_structure(model, seq: str, tokenizer, device: str):
     """Run baseline forward pass and return outputs with representation lists."""
+    # Monkey-patch the model/trunk forward methods onto this specific instance right before
+    # running it; no explicit "unpatch" step is needed because every call (baseline or
+    # intervened) re-patches both methods before running, so patches never go stale between calls.
     model.forward = types.MethodType(baseline_forward, model)
     model.trunk.forward = types.MethodType(baseline_forward_trunk, model.trunk)
     
     with torch.no_grad():
         inputs = tokenizer(seq, return_tensors='pt', add_special_tokens=False).to(device)
-        outputs = model(**inputs, num_recycles=0)
+        outputs = model(**inputs, num_recycles=0)  # num_recycles=0 -> exactly one trunk pass (no iterative refinement)
     
     return outputs
 
@@ -312,13 +354,15 @@ def get_intervened_structure(
     s_interventions: Dict[int, torch.Tensor],
 ):
     """Run forward pass with s intervention and return outputs with representation lists."""
+    # Re-patch the same model/trunk instance with the intervention-capable forward functions
+    # (overwriting whatever was patched in by a prior get_baseline_structure/get_intervened_structure call).
     model.forward = types.MethodType(intervention_forward_s_only, model)
     model.trunk.forward = types.MethodType(intervention_forward_trunk_s_only, model.trunk)
     
     with torch.no_grad():
         inputs = tokenizer(seq, return_tensors='pt', add_special_tokens=False).to(device)
         outputs = model(
-            **inputs, num_recycles=0,
+            **inputs, num_recycles=0,  # single trunk pass, same as baseline, so results are directly comparable
             intervention_blocks=intervention_blocks,
             s_interventions=s_interventions,
         )
@@ -332,13 +376,15 @@ def get_intervened_structure(
 
 def load_directions(path: str) -> ChargeDirections:
     """Load DoM directions from file. Handles both old and new formats."""
-    data = torch.load(path, weights_only=False)
+    data = torch.load(path, weights_only=False)  # weights_only=False: file stores plain dicts/np.ndarrays, not just tensors
     
     # Handle new format (s_directions only) vs old format (with z_directions)
     s_directions = data.get('s_directions', {})
     s_stds = data.get('s_stds', {})
     
     # For new format, z_directions might not exist
+    # .get(..., {}) makes missing keys degrade to empty dicts instead of raising KeyError,
+    # so files saved by either the old or new training format can both be loaded here.
     z_directions = data.get('z_directions', {})
     z_stds = data.get('z_stds', {})
     seq2pair_directions = data.get('seq2pair_directions', {})
@@ -394,20 +440,24 @@ def load_probes(path: str, rep_type: str) -> Optional[PairwiseProbes]:
 # ============================================================================
 
 class ProbeWrapper:
+    """Adapts a torch nn.Linear probe to sklearn's predict_proba/predict interface (unused here -- pre-trained sklearn LogisticRegression probes are loaded directly via load_probes instead)."""
     def __init__(self, linear_layer):
+        """Store the linear probe layer and put it in eval mode."""
         self.linear = linear_layer
         self.linear.eval()
     
     def predict_proba(self, X):
+        """Run the linear layer + softmax to produce per-class probabilities, mimicking sklearn's predict_proba."""
         with torch.no_grad():
             if isinstance(X, np.ndarray):
                 X = torch.tensor(X, dtype=torch.float32)
-            X = X.to(next(self.linear.parameters()).device)
+            X = X.to(next(self.linear.parameters()).device)  # move features onto whatever device the probe weights live on
             logits = self.linear(X)
             probs = torch.softmax(logits, dim=-1)
             return probs.cpu().numpy()
     
     def predict(self, X):
+        """Return the argmax class prediction, mimicking sklearn's predict."""
         probs = self.predict_proba(X)
         return probs.argmax(axis=-1)
 
@@ -422,10 +472,14 @@ def define_hairpin_topology(
     turn_length: int = 4,
 ) -> HairpinTopology:
     """Define a hypothetical hairpin topology for a region."""
+    # Split the region into: strand1 - turn - strand2, with the two strands assumed equal
+    # length and a fixed-length turn in between (4 residues is a typical beta-turn length).
     region_length = region_end - region_start
     strand_length = (region_length - turn_length) // 2
     
     if strand_length < 3:
+        # Too short for two real strands: fall back to a minimal 3-residue strand length and
+        # shrink the turn (but keep it at least 2 residues) so the topology still fits in region_length.
         strand_length = 3
         turn_length = max(2, region_length - 2 * strand_length)
     
@@ -440,6 +494,8 @@ def define_hairpin_topology(
     actual_strand2_len = strand2_end - strand2_start
     actual_strand1_len = strand1_end - strand1_start
     
+    # Antiparallel pairing: residue i of strand1 pairs with the mirrored residue counting
+    # backward from the end of strand2 (i.e. strand1 N->C aligns with strand2 C->N).
     for i in range(min(actual_strand1_len, actual_strand2_len)):
         res_i = strand1_start + i
         res_j = strand2_end - 1 - i
@@ -475,9 +531,16 @@ def create_s_interventions(
         s_dir = directions.s_directions[block]
         s_std = directions.s_stds[block]
         
+        # s_int: (seq_len, hidden_dim) additive offset tensor, zero everywhere except the two strands.
         s_int = torch.zeros(seq_len, len(s_dir), dtype=torch.float32, device=device)
+        # Scale the unit charge direction by both `magnitude` (a user-chosen knob) and s_std
+        # (that block's natural activation spread along this direction), so the same
+        # `magnitude` value corresponds to a comparable perturbation size across blocks.
         delta = magnitude * s_std * s_dir
         
+        # Push strand1 residues toward "positive charge" and strand2 residues toward "negative
+        # charge" along the DoM direction -- opposite-sign charges on the two strands is the
+        # hypothesized driver of cross-strand electrostatic complementarity in hairpin formation.
         for i in range(topology.strand1_start, topology.strand1_end):
             s_int[i] = torch.tensor(+delta, device=device)
         
@@ -510,11 +573,13 @@ def get_random_cases_from_parquet(
     print(f"Total rows: {len(df)}")
     
     # Get baseline cases (these have all the sequence info)
+    # The parquet stores one row per (case, block_set) combination (e.g. one "baseline" row plus
+    # rows for each intervened block-set); only the 'baseline' rows carry the sequence/region info.
     baseline = df[df['block_set'] == 'baseline'].copy()
     print(f"Baseline cases: {len(baseline)}")
     
     # Sample random cases
-    np.random.seed(seed)
+    np.random.seed(seed)  # global seed set for reproducibility; sample() below is separately seeded via random_state anyway
     if len(baseline) > n_cases:
         sampled = baseline.sample(n=n_cases, random_state=seed)
     else:
@@ -545,6 +610,8 @@ def analyze_probe_readouts_single_window(
     print(f"\n  Analyzing window {window_start}-{window_start + window_size - 1}...")
     
     # Track per-block probabilities
+    # Nested structure: results[baseline|intervened][strand1_pos_prob|strand2_neg_prob][block]
+    # -> list of per-(case, i, j) probe probabilities, later averaged for plotting.
     results = {
         'baseline': {
             'strand1_pos_prob': {block: [] for block in blocks_to_analyze},
@@ -557,6 +624,7 @@ def analyze_probe_readouts_single_window(
         'case_info': [],
     }
     
+    # Contiguous range of block indices that receive the intervention for this window (e.g. window_start=0, window_size=4 -> {0,1,2,3})
     intervention_blocks = set(range(window_start, window_start + window_size))
     
     for idx, row in tqdm(cases.iterrows(), total=len(cases), desc=f"  Window {window_start}-{window_start+window_size-1}", leave=False):
@@ -568,10 +636,11 @@ def analyze_probe_readouts_single_window(
         topology = define_hairpin_topology(region_start, region_end, turn_length=4)
         
         # Skip if topology doesn't make sense
+        # (region info came from a saved parquet; guard against the hypothetical strands running past this sequence's actual length)
         if topology.strand1_end > L or topology.strand2_end > L:
             continue
         
-        # Get baseline representations
+        # Get baseline representations (no intervention) for this sequence
         try:
             baseline_outputs = get_baseline_structure(model, seq, tokenizer, device)
         except Exception as e:
@@ -583,6 +652,7 @@ def analyze_probe_readouts_single_window(
             continue
         
         # Create and apply intervention
+        # Build the additive steering vectors for just the blocks in this window's intervention_blocks
         s_interventions = create_s_interventions(
             topology=topology,
             seq_len=L,
@@ -617,6 +687,8 @@ def analyze_probe_readouts_single_window(
         })
         
         # Sample j positions for pairwise features
+        # Rather than evaluating all L possible partner columns (expensive), sample 5 spread-out
+        # positions (start, quartiles, end) to check the charge readout is robust to the choice of j.
         j_positions = [0, L//4, L//2, 3*L//4, L-1]
         j_positions = [j for j in j_positions if j < L]
         
@@ -625,6 +697,7 @@ def analyze_probe_readouts_single_window(
             if block not in probes_z.positive_probes or block not in probes_z.negative_probes:
                 continue
             
+            # z_list_*[block] is shaped (1, L, L, C); index [0] to drop the batch dim -> (L, L, C) numpy array
             z_baseline = z_list_baseline[block][0].cpu().numpy()
             z_intervened = z_list_intervened[block][0].cpu().numpy()
             
@@ -632,13 +705,16 @@ def analyze_probe_readouts_single_window(
             probe_neg = probes_z.negative_probes[block]
             
             # Strand 1: Track P(positive)
+            # strand1 residues were pushed toward "positive" by the intervention, so we read out
+            # the positive-charge probe here; loop over every (i, j) combination of strand1 residue x sampled column.
             for i in range(topology.strand1_start, topology.strand1_end):
                 for j in j_positions:
                     if j == i:
                         continue
                     
+                    # reshape(1, -1): sklearn's predict_proba expects a 2D (n_samples, n_features) array
                     feat_base = z_baseline[i, j].reshape(1, -1)
-                    prob_pos_base = probe_pos.predict_proba(feat_base)[0][1]
+                    prob_pos_base = probe_pos.predict_proba(feat_base)[0][1]  # [0][1] = P(class 1 = "positive") for the single sample
                     results['baseline']['strand1_pos_prob'][block].append(prob_pos_base)
                     
                     feat_int = z_intervened[i, j].reshape(1, -1)
@@ -646,6 +722,7 @@ def analyze_probe_readouts_single_window(
                     results['intervened']['strand1_pos_prob'][block].append(prob_pos_int)
             
             # Strand 2: Track P(negative)
+            # strand2 residues were pushed toward "negative" by the intervention, so read out the negative-charge probe here.
             for i in range(topology.strand2_start, topology.strand2_end):
                 for j in j_positions:
                     if j == i:
@@ -659,6 +736,9 @@ def analyze_probe_readouts_single_window(
                     prob_neg_int = probe_neg.predict_proba(feat_int)[0][1]
                     results['intervened']['strand2_neg_prob'][block].append(prob_neg_int)
         
+        # Explicit cleanup each case iteration: this loop runs for every case x every window
+        # configuration (potentially hundreds of forward passes), so freeing the large z_list
+        # tensors and clearing the CUDA allocator cache promptly helps avoid GPU OOM over the sweep.
         del baseline_outputs, intervened_outputs, z_list_baseline, z_list_intervened, s_interventions
         torch.cuda.empty_cache()
     
@@ -687,6 +767,8 @@ def analyze_all_window_configurations(
     print(f"\nAnalyzing {len(window_starts)} window configurations...")
     print(f"Window size: {window_size}, Magnitude: {magnitude}")
     
+    # Sequentially sweep the intervention window across the requested starting blocks (e.g.
+    # 0-3, 1-4, ..., 9-12), reusing the same `cases` each time so results are directly comparable.
     for window_start in window_starts:
         results = analyze_probe_readouts_single_window(
             cases=cases,
@@ -715,7 +797,7 @@ def plot_probe_accuracies(
     output_dir: str,
 ):
     """Plot probe accuracies across blocks for binary probes."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))  # side-by-side panels: positive-charge probe, negative-charge probe
     
     blocks = sorted(probes_z.positive_accuracies.keys())
     
@@ -726,7 +808,7 @@ def plot_probe_accuracies(
     if probes_seq2pair is not None:
         acc_pos_s2p = [probes_seq2pair.positive_accuracies.get(b, 0) for b in blocks]
         ax.plot(blocks, acc_pos_s2p, 's-', label='seq2pair', linewidth=2, markersize=4)
-    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='chance')
+    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='chance')  # 0.5 = chance level for a balanced binary classifier
     ax.set_xlabel('Block', fontsize=12)
     ax.set_ylabel('Balanced Accuracy', fontsize=12)
     ax.set_title('Probe: Is Residue Positive? (K, R, H)', fontsize=13)
@@ -751,7 +833,7 @@ def plot_probe_accuracies(
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'probe_accuracies.png'), dpi=150)
-    plt.close()
+    plt.close()  # free the figure's memory now that it's saved to disk
     print(f"Saved probe_accuracies.png")
 
 
@@ -788,9 +870,11 @@ def plot_charge_shift_single_window(
         s2_base = data['baseline']['strand2_neg_prob'][block]
         s2_int = data['intervened']['strand2_neg_prob'][block]
         
+        # Only include blocks that actually accumulated samples (e.g. blocks without a trained probe are empty)
         if len(s1_base) > 0 and len(s2_base) > 0:
             valid_blocks.append(block)
             
+            # std / sqrt(n): standard error of the mean, used below for the shaded confidence bands
             baseline_s1_pos.append(np.mean(s1_base))
             baseline_s1_pos_std.append(np.std(s1_base) / np.sqrt(len(s1_base)))
             intervened_s1_pos.append(np.mean(s1_int))
@@ -811,15 +895,17 @@ def plot_charge_shift_single_window(
     baseline_s2_neg = np.array(baseline_s2_neg)
     intervened_s2_neg = np.array(intervened_s2_neg)
     
-    # Create subdir for this window
+    # Create subdir for this window (keeps output from each sweep step separate, e.g. window_10_13/, window_11_14/, ...)
     window_dir = os.path.join(output_dir, f'window_{window_start}_{window_end}')
     os.makedirs(window_dir, exist_ok=True)
     
-    # Plot 1: Main figure
+    # Plot 1: Main figure -- two stacked panels (strand1 P(+), strand2 P(-)) each showing
+    # baseline vs. post-intervention curves with shaded uncertainty bands across all blocks.
     fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
     
     # Top: Strand 1 P(+)
     ax = axes[0]
+    # Shaded band = mean +/- 1 SEM (fill_between draws the region between the two curves)
     ax.fill_between(valid_blocks, 
                     baseline_s1_pos - np.array(baseline_s1_pos_std),
                     baseline_s1_pos + np.array(baseline_s1_pos_std),
@@ -834,6 +920,7 @@ def plot_charge_shift_single_window(
     ax.plot(valid_blocks, intervened_s1_pos, 's-', color='tab:red',
             linewidth=2, markersize=4, label='After Intervention')
     
+    # axvspan/axvline: highlight which blocks (x-axis) received the intervention this sweep step
     ax.axvspan(window_start, window_end, alpha=0.2, color='yellow', label='Intervention Window')
     ax.axvline(x=window_start, color='orange', linestyle='--', linewidth=2, alpha=0.7)
     
@@ -873,7 +960,8 @@ def plot_charge_shift_single_window(
     plt.savefig(os.path.join(window_dir, 'charge_shift_across_blocks.png'), dpi=150)
     plt.close()
     
-    # Plot 2: Delta plot
+    # Plot 2: Delta plot -- collapses the baseline/intervened pair from Plot 1 into a single
+    # "intervened minus baseline" curve per strand, making the intervention's effect size easier to read at a glance.
     fig, ax = plt.subplots(figsize=(14, 6))
     
     delta_s1_pos = intervened_s1_pos - baseline_s1_pos
@@ -931,6 +1019,7 @@ def plot_all_windows_comparison(
             s2_base = data['baseline']['strand2_neg_prob'][block]
             s2_int = data['intervened']['strand2_neg_prob'][block]
             
+            # delta = mean(intervened) - mean(baseline) probe probability at this block (same definition used throughout this module)
             if len(s1_base) > 0 and len(s2_base) > 0:
                 valid_blocks.append(block)
                 delta_s1.append(np.mean(s1_int) - np.mean(s1_base))
@@ -944,6 +1033,8 @@ def plot_all_windows_comparison(
     # Plot 1: All windows on same plot (Strand 1)
     fig, ax = plt.subplots(figsize=(16, 8))
     
+    # Perceptually-uniform colormap indexed by sweep order, so window curves are easy to
+    # order visually (e.g. early-block windows vs late-block windows) even with many overlapping lines.
     colors = plt.cm.viridis(np.linspace(0, 1, n_windows))
     
     for i, window_start in enumerate(window_starts):
@@ -989,6 +1080,9 @@ def plot_all_windows_comparison(
     fig, axes = plt.subplots(1, 2, figsize=(18, 8))
     
     # Get common blocks
+    # Intersect valid_blocks across every window configuration so the heatmap matrix below can
+    # use a single consistent set of block columns (a block missing from any one window would
+    # otherwise leave a ragged/undefined entry).
     common_blocks = None
     for ws in window_starts:
         vb, _ = all_deltas_s1[ws]
@@ -999,6 +1093,7 @@ def plot_all_windows_comparison(
     common_blocks = sorted(common_blocks)
     
     # Build matrices
+    # Rows = intervention window configuration, columns = block index; missing entries default to 0.
     delta_matrix_s1 = np.zeros((n_windows, len(common_blocks)))
     delta_matrix_s2 = np.zeros((n_windows, len(common_blocks)))
     
@@ -1015,12 +1110,14 @@ def plot_all_windows_comparison(
     
     # Strand 1 heatmap
     ax = axes[0]
+    # vmin/vmax=+/-0.5: fixed, symmetric color scale centered on "no shift" (0), so the two
+    # heatmaps (and different runs of this script) are visually comparable on the same color scale.
     im = ax.imshow(delta_matrix_s1, aspect='auto', cmap='RdBu_r', 
                    vmin=-0.5, vmax=0.5)
     ax.set_xlabel('Block', fontsize=12)
     ax.set_ylabel('Intervention Window Start', fontsize=12)
     ax.set_title('Strand 1: Δ P(+)', fontsize=13)
-    ax.set_xticks(range(0, len(common_blocks), 5))
+    ax.set_xticks(range(0, len(common_blocks), 5))  # label every 5th block to keep the x-axis readable
     ax.set_xticklabels([common_blocks[i] for i in range(0, len(common_blocks), 5)])
     ax.set_yticks(range(n_windows))
     ax.set_yticklabels([f'{ws}-{ws+window_size-1}' for ws in window_starts])
@@ -1045,10 +1142,15 @@ def plot_all_windows_comparison(
     plt.close()
     
     # Plot 4: Grid of subplots showing each window
-    n_cols = 3
-    n_rows = (n_windows + n_cols - 1) // n_cols
+    n_cols = 3  # fixed grid width; number of rows grows to fit however many windows were swept
+    n_rows = (n_windows + n_cols - 1) // n_cols  # ceiling division: n_rows * n_cols >= n_windows
     
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(6*n_cols, 5*n_rows), sharex=True, sharey=True)
+    # NOTE: possible bug -- when n_windows == 1, n_rows == 1 and n_cols == 3, so plt.subplots
+    # still returns a 1D array of 3 Axes (squeeze only collapses dims that are exactly 1x1);
+    # the `else [axes]` branch then wraps that whole 3-Axes array into a length-1 list, so
+    # axes[0] would be an ndarray (not a single Axes) and the `ax.plot(...)` calls below would
+    # raise AttributeError. Only reachable if window_start_min == window_start_max (n_windows == 1).
     axes = axes.flatten() if n_windows > 1 else [axes]
     
     for i, window_start in enumerate(window_starts):
@@ -1068,7 +1170,7 @@ def plot_all_windows_comparison(
         ax.grid(alpha=0.3)
         ax.legend(loc='best', fontsize=7)
     
-    # Hide empty subplots
+    # Hide empty subplots (n_rows * n_cols may exceed n_windows, leaving trailing unused grid cells)
     for i in range(n_windows, len(axes)):
         axes[i].set_visible(False)
     
@@ -1101,6 +1203,9 @@ def plot_summary_all_windows(
         blocks = sorted(data['baseline']['strand1_pos_prob'].keys())
         
         # Average delta at blocks AFTER the intervention window
+        # Restricting to blocks downstream of the intervention window avoids trivially measuring
+        # the injected offset itself (which directly dominates `s` inside the window) and instead
+        # captures how much of the induced charge shift persists/propagates further into the trunk.
         post_delta_s1 = []
         post_delta_s2 = []
         
@@ -1132,7 +1237,7 @@ def plot_summary_all_windows(
     # Top-left: Bar chart of average post-intervention delta
     ax = axes[0, 0]
     x = np.arange(len(window_starts))
-    width = 0.35
+    width = 0.35  # bar width; offsetting by +/- width/2 below places the two bars per window side-by-side instead of overlapping
     ax.bar(x - width/2, summary_df['avg_delta_s1'], width, label='Δ P(+) Strand 1', color='tab:blue', alpha=0.7)
     ax.bar(x + width/2, summary_df['avg_delta_s2'], width, label='Δ P(-) Strand 2', color='tab:red', alpha=0.7)
     ax.axhline(y=0, color='gray', linestyle='-', linewidth=1)
@@ -1200,9 +1305,10 @@ def plot_summary_all_windows(
     
     # Bottom-right: Text summary
     ax = axes[1, 1]
-    ax.axis('off')
+    ax.axis('off')  # this panel is used purely as a text box, not a data plot
     
     text_lines = [
+        # idxmax() locates the window_start row with the largest avg_delta_s1/s2, used to report the "best" window below
         "Summary Statistics",
         "=" * 40,
         f"Window size: {window_size}",
@@ -1220,6 +1326,8 @@ def plot_summary_all_windows(
         f"{summary_df['avg_delta_s2'].max():.3f}",
     ]
     
+    # transform=ax.transAxes: position the text box using axes-relative coordinates (0-1 in
+    # each direction) rather than data coordinates, since this axis has no real data (axis('off') above).
     ax.text(0.1, 0.9, '\n'.join(text_lines), transform=ax.transAxes,
             fontsize=10, verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
@@ -1240,6 +1348,7 @@ def plot_summary_all_windows(
 # ============================================================================
 
 def parse_args():
+    """Parse command-line arguments for the early-blocks window sweep."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=str, default='probing_results_early_blocks')
     parser.add_argument('--directions', type=str, 
@@ -1269,6 +1378,7 @@ def parse_args():
 
 
 def main():
+    """Run the full early-blocks intervention window sweep: load model/directions/probes, sample cases, sweep the intervention window, then generate all plots and save results."""
     args = parse_args()
     
     os.makedirs(args.output, exist_ok=True)
@@ -1278,6 +1388,8 @@ def main():
     print(f"Using device: {device}")
     
     # Define window configurations
+    # One window per starting block from window_start_min to window_start_max (inclusive), each
+    # covering window_size consecutive blocks -- this is the full list of sweep steps analyzed below.
     window_starts = list(range(args.window_start_min, args.window_start_max + 1))
     
     print(f"\n" + "="*60)
@@ -1289,10 +1401,8 @@ def main():
     print(f"Magnitude: {args.magnitude}")
     print(f"Cases per window: {args.n_cases}")
     
-    # Load model
-    print("\nLoading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    # Load model (shared loader auto-selects a memory-efficient precision mode; see src/utils/model_utils.py)
+    model, tokenizer = load_esmfold(device)
     
     # Load directions
     print(f"\nLoading directions from {args.directions}...")
@@ -1303,6 +1413,7 @@ def main():
     probes_z = load_probes(args.probes_path, 'z')
     
     if probes_z is None:
+        # Probes are trained separately (not by this script) and must already exist on disk
         print("ERROR: Could not load pre-trained probes!")
         print(f"Please ensure probes exist at {args.probes_path}/probes_z.pkl")
         return
@@ -1380,7 +1491,8 @@ def main():
         output_dir=args.output,
     )
     
-    # Save all results
+    # Save all results (raw per-window probe-probability data + config), so the sweep doesn't
+    # need to be rerun to regenerate plots or compute further statistics later.
     torch.save({
         'all_results': all_results,
         'window_starts': window_starts,
@@ -1402,7 +1514,8 @@ def main():
         data = all_results[window_start]
         window_end = window_start + args.window_size - 1
         
-        # Compute average delta across all blocks after intervention
+        # Compute average delta across all blocks after intervention (same post-window
+        # averaging logic as plot_summary_all_windows, repeated here for the console printout)
         all_delta_s1 = []
         all_delta_s2 = []
         

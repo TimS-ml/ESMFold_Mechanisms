@@ -22,6 +22,8 @@ import matplotlib.pyplot as plt
 # =============================================================================
 # FONT SIZE CONFIGURATION - Edit these values to customize
 # =============================================================================
+# Note: 'title' is defined here but this module never actually sets a figure/axes
+# title anywhere below, so this entry is currently unused.
 FONT_SIZES = {
     'title': 24,
     'axis_label': 18,
@@ -56,10 +58,14 @@ def plot_r2_by_block(eval_df: pd.DataFrame, output_path: str, color: str, label:
     fig, ax = plt.subplots(figsize=PLOT_CONFIG['figsize'])
     
     # Sort by block index
+    # (ensures the line/fill plot renders in increasing x-order regardless of
+    # the row order in the input CSV)
     eval_df = eval_df.sort_values('block')
     blocks = eval_df['block'].values
     
     # Get R² values - handle different column names
+    # (z_probing_distance.py writes 'r2' to test_evaluation.csv but only
+    # 'r2_train' to train_evaluation.csv, so this function supports both)
     if 'r2' in eval_df.columns:
         r2_values = eval_df['r2'].values
     elif 'r2_train' in eval_df.columns:
@@ -69,13 +75,19 @@ def plot_r2_by_block(eval_df: pd.DataFrame, output_path: str, color: str, label:
     
     # Compute confidence interval (using standard error if available, otherwise estimate)
     if 'r2_std' in eval_df.columns:
+        # Not currently produced by z_probing_distance.py's CSV outputs, but
+        # supported here in case a future/alternate source provides it directly.
         r2_std = eval_df['r2_std'].values
     elif 'n_samples' in eval_df.columns:
         # Rough approximation of SE for R²
+        # (large-sample normal approximation, scaled by 1.96 for an approximate
+        # 95% CI half-width; `+ 1e-8` guards against division by zero when n <= 2)
         n = eval_df['n_samples'].values
         r2_std = np.sqrt((1 - r2_values**2) / (n - 2 + 1e-8)) * 1.96
     else:
         # Default: use 5% of R² value as approximate CI
+        # (no sample-size info available at all, so this is a crude,
+        # non-statistical band just so the plot still has a visible fill)
         r2_std = np.abs(r2_values) * 0.05
     
     # Confidence interval bounds
@@ -102,6 +114,7 @@ def plot_r2_by_block(eval_df: pd.DataFrame, output_path: str, color: str, label:
     ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
     
     # Remove top and right spines
+    # (open-axis aesthetic, a common matplotlib style tweak)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     
@@ -119,6 +132,8 @@ def plot_r2_by_block(eval_df: pd.DataFrame, output_path: str, color: str, label:
 
 
 def main():
+    """CLI entry point: load train/test probe-evaluation CSVs (produced by
+    z_probing_distance.py) and render a separate R²-vs-block plot for each."""
     parser = argparse.ArgumentParser(description='Plot probe R² scores by block')
     parser.add_argument('--train_path', type=str,
                         default="probing_results/train_evaluation.csv",
@@ -133,6 +148,8 @@ def main():
     os.makedirs(args.output, exist_ok=True)
     
     # Plot 1: Train R²
+    # (Test R² below mirrors this block; each is skipped with a warning rather
+    # than raising if its CSV wasn't found, so one missing file doesn't block the other.)
     if os.path.exists(args.train_path):
         print(f"Loading train evaluation from {args.train_path}...")
         train_df = pd.read_csv(args.train_path)

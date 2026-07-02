@@ -25,9 +25,13 @@ LEGEND_FONTSIZE = 18
 
 FIGSIZE = (12, 6)
 
+# Width (in blocks) of the rolling-average window used to smooth noisy
+# per-block statistics before plotting; 1 would mean no smoothing.
 SMOOTHING_WINDOW = 3
 
 # Colors
+# '#d95f02'/'#1b9e77' are the orange/teal pair from the ColorBrewer "Dark2"
+# qualitative palette (colorblind-friendly, high contrast against each other).
 COLOR_SEQ2PAIR = '#d95f02'   # Burnt orange
 COLOR_PAIR2SEQ = '#1b9e77'   # Teal/green
 
@@ -42,11 +46,16 @@ def smooth_series(series, window=SMOOTHING_WINDOW):
     """Apply sliding window smoothing to a pandas Series."""
     if window <= 1:
         return series
+    # center=True aligns each output point with the middle of its window (rather
+    # than a trailing/causal average), and min_periods=1 lets the window shrink
+    # near the series edges instead of producing NaNs there.
     return series.rolling(window=window, center=True, min_periods=1).mean()
 
 
 def normalize_series(series):
     """Min-max normalize a series to [0, 1]."""
+    # + 1e-10 guards against division by zero when the series is constant
+    # (max == min), which would otherwise produce NaN/inf.
     return (series - series.min()) / (series.max() - series.min() + 1e-10)
 
 
@@ -71,6 +80,9 @@ def plot_information_flow_combined_testset(
     # Get mean and std by block (across all sequences, regardless of label)
     seq2pair_mean = stats_df.groupby('block')['seq2pair_relative_global'].mean()
     seq2pair_std = stats_df.groupby('block')['seq2pair_relative_global'].std()
+    # SEM (standard error of the mean) = std / sqrt(n), with n = number of distinct
+    # sequences contributing to that block's group; this measures uncertainty in the
+    # *mean* estimate itself (for the CI band below), not the spread of raw values.
     seq2pair_sem = seq2pair_std / np.sqrt(stats_df.groupby('block')['seq_idx'].nunique())
     
     pair2seq_mean = stats_df.groupby('block')['pair2seq_relative_global'].mean()
@@ -78,6 +90,8 @@ def plot_information_flow_combined_testset(
     pair2seq_sem = pair2seq_std / np.sqrt(stats_df.groupby('block')['seq_idx'].nunique())
     
     # Smooth
+    # (mean curves and their SEM bands use the same rolling window so the shaded
+    # confidence band stays visually consistent with the smoothed line)
     seq2pair_smooth = smooth_series(seq2pair_mean, smoothing_window)
     pair2seq_smooth = smooth_series(pair2seq_mean, smoothing_window)
     seq2pair_sem_smooth = smooth_series(seq2pair_sem, smoothing_window)
@@ -93,6 +107,10 @@ def plot_information_flow_combined_testset(
         pair2seq_norm = normalize_series(pair2seq_smooth)
         
         # Scale SEM proportionally
+        # (SEM is a *scale*/spread quantity, so only the min-max range's scale factor
+        # is applied here, not the min-subtraction shift that normalize_series()
+        # applies to the mean -- a shift would be meaningless for an error band,
+        # which is centered on the already-shifted mean)
         seq2pair_sem_norm = seq2pair_sem_smooth / (seq2pair_max - seq2pair_min + 1e-10)
         pair2seq_sem_norm = pair2seq_sem_smooth / (pair2seq_max - pair2seq_min + 1e-10)
         
@@ -113,6 +131,8 @@ def plot_information_flow_combined_testset(
     blocks = seq2pair_plot.index
     
     # Plot seq2pair
+    # First fill_between (0 -> value) draws a solid "area under the curve" shading;
+    # the second (mean -+ ci) overlays a lighter confidence band around the line itself.
     if use_fill:
         ax.fill_between(blocks, 0, seq2pair_plot.values,
                         alpha=FILL_ALPHA, color=COLOR_SEQ2PAIR)
@@ -137,13 +157,16 @@ def plot_information_flow_combined_testset(
     ax.set_xlabel('Block', fontsize=LABEL_FONTSIZE)
     ax.set_ylabel(ylabel, fontsize=LABEL_FONTSIZE)
     ax.set_title('Information Flow in Folding Trunk', fontsize=TITLE_FONTSIZE, pad=12)
-    ax.set_xlim(0, 47)
+    ax.set_xlim(0, 47)  # 0..47 = the 48 trunk block indices (NUM_BLOCKS - 1)
     if normalize:
         ax.set_ylim(0, 1.1)
     ax.tick_params(axis='both', labelsize=TICK_FONTSIZE)
     ax.legend(loc='best', fontsize=LEGEND_FONTSIZE)
     ax.grid(alpha=0.3)
     
+    # Encode which options were used directly into the output filename so all
+    # four normalize/use_fill combinations (called from generate_all_plots) land
+    # in distinct files instead of overwriting each other.
     norm_str = '_normalized' if normalize else ''
     fill_str = '_filled' if use_fill else ''
     plt.tight_layout()
@@ -162,6 +185,9 @@ def plot_information_flow_multi_smoothing(
     """
     Create the same plot with different smoothing windows for comparison.
     """
+    # Same mean/SEM/normalize/plot pipeline as plot_information_flow_combined_testset
+    # above, just repeated once per candidate smoothing window so the effect of the
+    # window size on the curve's smoothness can be compared side-by-side.
     for window in smoothing_windows:
         fig, ax = plt.subplots(figsize=FIGSIZE)
         
@@ -187,7 +213,7 @@ def plot_information_flow_multi_smoothing(
             
             seq2pair_plot = normalize_series(seq2pair_smooth)
             pair2seq_plot = normalize_series(pair2seq_smooth)
-            seq2pair_ci = (seq2pair_sem_smooth / (seq2pair_range + 1e-10)) * 1.96
+            seq2pair_ci = (seq2pair_sem_smooth / (seq2pair_range + 1e-10)) * 1.96  # 1.96 = z-score for 95% CI
             pair2seq_ci = (pair2seq_sem_smooth / (pair2seq_range + 1e-10)) * 1.96
             ylabel = 'Scaled Relative Contribution'
         else:
@@ -225,6 +251,9 @@ def plot_information_flow_multi_smoothing(
         ax.grid(alpha=0.3)
         
         n_seqs = stats_df['seq_idx'].nunique()
+        # transform=ax.transAxes places the label using axes-fraction coordinates
+        # (0-1 in each dimension) so it stays pinned to the bottom-right corner
+        # regardless of the data's actual x/y ranges.
         ax.text(0.98, 0.02, f'n={n_seqs}', transform=ax.transAxes,
                 fontsize=TICK_FONTSIZE, ha='right', va='bottom',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
@@ -247,12 +276,15 @@ def print_summary(stats_df: pd.DataFrame):
     print(f"\nTotal sequences: {n_seqs}")
     
     if 'label' in stats_df.columns:
+        # Number of distinct sequences per class label (e.g. hairpin vs non-hairpin)
         print(f"Composition: {stats_df.groupby('label')['seq_idx'].nunique().to_dict()}")
     
     for metric, name in [
         ('seq2pair_relative_global', 'Seq→Pair'),
         ('pair2seq_relative_global', 'Pair→Seq'),
     ]:
+        # Split the 48 trunk blocks into early/mid/late thirds (0-15, 16-31, 32-47)
+        # for a coarse regime-level comparison.
         early = stats_df[stats_df['block'] < 16][metric]
         mid = stats_df[(stats_df['block'] >= 16) & (stats_df['block'] < 32)][metric]
         late = stats_df[stats_df['block'] >= 32][metric]
@@ -268,6 +300,8 @@ def generate_all_plots(stats_df: pd.DataFrame, output_dir: str, smoothing_window
     print("\n--- Generating plots ---")
     
     # Main plots (normalized and non-normalized, with and without fill)
+    # All 4 combinations are generated so the right variant can be picked later
+    # (e.g. filled for a quick look, unfilled+unnormalized for a paper figure).
     plot_information_flow_combined_testset(stats_df, output_dir, normalize=True, use_fill=True)
     plot_information_flow_combined_testset(stats_df, output_dir, normalize=True, use_fill=False)
     plot_information_flow_combined_testset(stats_df, output_dir, normalize=False, use_fill=True)
@@ -278,6 +312,7 @@ def generate_all_plots(stats_df: pd.DataFrame, output_dir: str, smoothing_window
 
 
 def main():
+    """CLI entry point: load the precomputed stats table and generate all information-flow plots."""
     parser = argparse.ArgumentParser(description="Plot information flow relative contributions")
     parser.add_argument("--stats", type=str,
                         default="information_flow_results/information_flow_stats.parquet",
@@ -291,6 +326,7 @@ def main():
     args = parser.parse_args()
     
     # Load stats
+    # (accepts either the default parquet output or a csv export of it)
     print(f"Loading {args.stats}...")
     if args.stats.endswith('.parquet'):
         stats_df = pd.read_parquet(args.stats)

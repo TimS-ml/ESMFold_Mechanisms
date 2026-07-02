@@ -34,6 +34,9 @@ import warnings
 import pandas as pd
 def clean_pdb_string(pdb_string):
     """Remove non-standard records that confuse DSSP/mkdssp."""
+    # PARENT (template/provenance) and REMARK 220 (experimental-technique)
+    # lines are extra records some ESMFold/OpenFold PDB writers emit; mkdssp's
+    # strict parser chokes on them, so they're stripped before DSSP sees the file.
     skip_prefixes = ("PARENT", "REMARK 220")
     return "\n".join(
         line for line in pdb_string.split("\n")
@@ -42,34 +45,60 @@ def clean_pdb_string(pdb_string):
 # ---------- DSSP from outputs ----------
 def run_dssp_from_outputs(outputs, model, batch_idx=0):
     """Save ESMFold output to a temp PDB and run DSSP once."""
+    # Detach + clone so we don't hold references into the live autograd graph
+    # and don't mutate the caller's `outputs` dict in place.
     detached_outputs = {
         k: (v.detach().clone() if isinstance(v, torch.Tensor) else v)
         for k, v in outputs.items()
     }
 
+    # output_to_pdb() returns one PDB string per batch element; batch_idx
+    # picks which structure in the batch to run DSSP on.
     pdb_str = model.output_to_pdb(detached_outputs)[batch_idx]
     pdb_str = clean_pdb_string(pdb_str)
 
+    # delete=False: the file must still exist on disk after this `with` block
+    # closes it, because DSSP (below) shells out to the external `mkdssp`
+    # binary, which re-reads the PDB from its path rather than from memory.
     pdb_path = tempfile.NamedTemporaryFile(suffix=".pdb", delete=False).name
     with open(pdb_path, "w") as f:
         f.write(pdb_str)
 
-    parser = PDB.PDBParser(QUIET=True)
+    parser = PDB.PDBParser(QUIET=True)  # QUIET suppresses minor format warnings
     structure = parser.get_structure("ESMFold", pdb_path)
     model0 = structure[0]
 
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="Bio.PDB.DSSP")
+            # DSSP needs both the parsed Model (for coordinate/residue access)
+            # and the on-disk path (mkdssp reads the file itself).
             dssp = DSSP(model0, pdb_path, dssp="mkdssp")
     except Exception as e:
         warnings.warn(f"DSSP failed: {e}", RuntimeWarning)
+        # NOTE: possible bug -- this returns a 3-tuple (None, None, None) on
+        # failure, but the success path below returns a single `df` value.
+        # detect_hairpins() calls this as `dssp_df = run_dssp_from_outputs(...)`
+        # then checks `if dssp_df is None`, which will NOT catch this failure
+        # (a 3-tuple is not None), so it would proceed to do `dssp_df["Chain"]`
+        # on a tuple and raise TypeError instead of hitting the intended path.
         return None, None, None
 
     rows = []
     for key in dssp.keys():
+        # DSSP dict keys are (chain_id, residue_id); residue_id follows
+        # Biopython's standard (hetero_flag, resseq, insertion_code) format.
         chain_id, (hetatm_flag, resseq, icode) = key
+        # dssp[key] is a tuple; index 1 = 1-letter amino acid, index 2 = the
+        # raw DSSP secondary-structure code (later fields hold accessibility,
+        # phi/psi, H-bond energies, etc., which we don't need here).
         aa, ss = dssp[key][1], dssp[key][2]
+        # Collapse DSSP's 8-state code to 3 states: {H, G, I} are the three
+        # helix flavors (alpha-, 3_10-, and pi-helix -- they differ only in
+        # H-bond turn length, i->i+4/i+3/i+5) -> "H"; {E, B} are strand-like
+        # (E = extended beta-ladder strand, B = isolated single-residue
+        # bridge) -> "E"; everything else (turns, bends, coil/"-") -> "C".
+        # This 3-state scheme is what detect_hairpins() scans for strands.
         simp = "E" if ss in ["E", "B"] else ("H" if ss in ["H", "I", "G"] else "C")
         rows.append((chain_id, resseq, aa, ss, simp))
     df = pd.DataFrame(rows, columns=["Chain", "ResNum", "AA", "SecStruct", "SimpleSS"])
@@ -101,10 +130,17 @@ def run_dssp_on_pdb(pdb_path):
 
     rows = []
     for key in dssp.keys():
+        # key = (chain_id, residue_id), residue_id = (hetero_flag, resseq, icode)
+        # -- Biopython's standard PDB residue-ID tuple format.
         chain_id, (hetflag, resseq, icode) = key
         aa = dssp[key][1]  # 1-letter amino acid
         ss = dssp[key][2]  # DSSP annotation (H, E, C, etc.)
 
+        # DSSP's 8-state code collapses to 3 states here: {H, G, I} are the
+        # three helix types (alpha-, 3_10-, and pi-helix -- differing only in
+        # H-bond turn length, i->i+4/i+3/i+5) -> "H"; {E, B} are strand-like
+        # (E = extended ladder strand, B = isolated single-residue bridge)
+        # -> "E"; remaining codes (T=turn, S=bend, "-"/" "=coil) -> "C".
         # Simple 3-state mapping: E (beta), H (helix), C (coil)
         simp = (
             "E" if ss in ["E", "B"]
@@ -134,6 +170,9 @@ def detect_hairpins(outputs, model, min_len=2, max_loop=5):
     """
 
     dssp_df = run_dssp_from_outputs(outputs, model)
+    # NOTE: possible bug -- on DSSP failure, run_dssp_from_outputs() returns
+    # the 3-tuple (None, None, None), not a bare None, so this check never
+    # actually catches the failure case (see the NOTE inside that function).
     if dssp_df is None:
         print("❌ DSSP failed.")
         return None, None
@@ -147,16 +186,24 @@ def detect_hairpins(outputs, model, min_len=2, max_loop=5):
         start = None
 
         # Find continuous β-strand segments in SimpleSS
+        # Run-length scan: `start` marks the first residue of the current run
+        # of "E" labels; a run is only kept (appended to `strands`) once it
+        # breaks AND was at least min_len long, otherwise it's discarded as
+        # too short to count as a real strand.
         for i, row in cdf.iterrows():
             if row["SimpleSS"] == "E":
                 if start is None:
                     start = i
             else:
                 if start is not None and i - start >= min_len:
+                    # i-1 because `i` is the first non-"E" residue, i.e. one
+                    # past the end of the strand.
                     strands.append((start, i - 1))
                 start = None
 
         # Handle strand that reaches to the end
+        # (the loop above only closes a run when it hits a break; a run still
+        # open when residues run out needs to be closed off here instead)
         if start is not None and len(cdf) - start >= min_len:
             strands.append((start, len(cdf) - 1))
 
@@ -164,8 +211,13 @@ def detect_hairpins(outputs, model, min_len=2, max_loop=5):
         for i in range(len(strands) - 1):
             s1_start, s1_end = strands[i]
             s2_start, s2_end = strands[i + 1]
+            # Residues strictly between the two strands (0 if sequence-adjacent).
             loop_len = s2_start - s1_end - 1
 
+            # A hairpin requires a *short* connecting loop -- this is what
+            # distinguishes a hairpin (two strands joined by a tight turn)
+            # from two unrelated strands that happen to both be beta but are
+            # far apart in sequence.
             if 0 <= loop_len <= max_loop:
                 hairpins.append((chain_id, s1_start, s1_end, s2_start, s2_end))
 
@@ -182,6 +234,11 @@ def get_CB_or_virtual(residue):
     If CB is missing (e.g., Gly), construct a virtual CB from N, CA, C.
     Uses the standard OpenFold/ESMFold virtual CB construction.
     """
+    # Glycine has no side chain beyond the alpha carbon (its "R group" is a
+    # single H), so it has no CB atom in the PDB; every other standard amino
+    # acid does. The virtual-CB construction below gives glycine a consistent
+    # stand-in side-chain-direction vector so downstream code (e.g. handedness)
+    # doesn't need a per-residue-type special case.
     if "CB" in residue:
         return residue["CB"].coord
 
@@ -194,10 +251,19 @@ def get_CB_or_virtual(residue):
     c = C - CA
 
     # Normalize
+    # NOTE: possible bug -- `np` (numpy) is used from here on but is never
+    # imported anywhere in this file (only torch/pandas/etc. are imported
+    # above); this raises NameError: name 'np' is not defined the first time
+    # a residue is missing its CB atom (e.g. any glycine).
     b = b / np.linalg.norm(b)
     c = c / np.linalg.norm(c)
 
     # Virtual CB direction (OpenFold coefficients)
+    # Fixed empirical coefficients (OpenFold/AlphaFold idealized backbone
+    # geometry) that reconstruct the Cb direction from the local backbone
+    # frame: a linear combination of the N->CA and CA->C bond vectors plus
+    # their cross product (the out-of-plane component, which encodes the
+    # L-amino-acid chirality).
     v = -0.58273431 * b + 0.56802827 * c + 0.54067466 * np.cross(b, c)
     v = v / np.linalg.norm(v)
 
@@ -229,6 +295,8 @@ def compute_handedness_from_structure(structure, chain_df, s1_end_idx, s2_start_
 
     # Handle possible missing residues gracefully
     try:
+        # Biopython residue IDs are (hetero_flag, seqnum, icode) tuples; " "
+        # (space) means a standard amino acid with no insertion code.
         r1 = chain[(" ", res1, " ")]
         r2 = chain[(" ", res2, " ")]
     except KeyError as e:
@@ -244,7 +312,22 @@ def compute_handedness_from_structure(structure, chain_df, s1_end_idx, s2_start_
     v = CA2 - CA1
     n = CB1 - CA1
 
+    # Handedness = sign of the scalar triple product (u x v) . n. `u` anchors
+    # the local backbone/strand direction at the last residue of strand 1;
+    # `v` is the vector that bridges across the turn to the first residue of
+    # strand 2; `n` points from Ca1 toward its side chain (Cb), giving a fixed
+    # chirality reference. u x v is normal to the plane spanned by the strand
+    # and the bridge, so dotting with n is positive when the bridge crosses to
+    # the same side of the strand as the side chain, and negative on the
+    # opposite side -- these two cases correspond to the two classic
+    # cross-strand turn geometries (mirror images of each other, commonly
+    # described as Type I vs Type II / "left-handed" vs "right-handed"
+    # hairpin turns).
     triple = np.dot(np.cross(u, v), n)
+    # Dividing by the product of vector norms removes the (largely
+    # bond-length-driven) magnitude of u/v/n so `mag` mainly reflects the
+    # angular/chirality relationship rather than raw distances; eps guards
+    # against division by zero if any vector were degenerate.
     denom = (np.linalg.norm(u) * np.linalg.norm(v) * np.linalg.norm(n)) + eps
     mag = triple / denom
 
@@ -274,13 +357,18 @@ def get_handedness_vectors_from_structure(structure, chain_df, s1_end_idx, s2_st
     N1 = r1["N"].coord
     CA1 = r1["CA"].coord
     C1 = r1["C"].coord
-    CB1 = get_CB_or_virtual(r1)
+    CB1 = get_CB_or_virtual(r1)  # falls back to a constructed virtual CB for Gly
     CA2 = r2["CA"].coord
 
+    # Same u/v/n definitions as compute_handedness_from_structure (kept in
+    # sync manually) -- this function only builds arrows for the viewer, it
+    # does not recompute the handedness sign itself.
     u = C1 - N1
     v = CA2 - CA1
     n = CB1 - CA1
 
+    # Purely cosmetic: stretches the (bond-length-scale) vectors so they
+    # render as visible arrows in py3Dmol; doesn't affect any handedness math.
     scale = 2.0
 
     arrows = {
@@ -331,6 +419,10 @@ def visualize_hairpin_handedness_from_cif_or_pdb(
     """
     # --- run DSSP ---
     if is_cif:
+        # NOTE: possible bug -- run_dssp_on_cif() is called here but is not
+        # defined or imported anywhere in this module (only run_dssp_on_pdb
+        # is defined below); calling this with is_cif=True raises
+        # NameError: name 'run_dssp_on_cif' is not defined.
         structure, dssp_df = run_dssp_on_cif(cif_or_pdb)
         if dssp_df is None:
             print("❌ DSSP failed.")
@@ -338,6 +430,14 @@ def visualize_hairpin_handedness_from_cif_or_pdb(
     else:
         structure, dssp_df = run_dssp_on_pdb(cif_or_pdb)
 
+    # NOTE: possible bug -- detect_hairpins() is defined above as
+    # detect_hairpins(outputs, model, min_len=2, max_loop=5) (it internally
+    # re-runs DSSP from raw model outputs) and returns a (bool, list) tuple.
+    # Calling it here with a single `dssp_df` argument would raise TypeError
+    # (missing required 'model' argument); even if the call were fixed, the
+    # `len(hairpins) == 0` check and the `for chain_id, ... in hairpins`
+    # unpacking below both assume `hairpins` is already the plain list of
+    # hairpin tuples, not the (bool, list) pair detect_hairpins() returns.
     hairpins = detect_hairpins(dssp_df)
     if len(hairpins) == 0:
         print("❌ No β-hairpins detected")
@@ -345,7 +445,8 @@ def visualize_hairpin_handedness_from_cif_or_pdb(
 
     # Pick best matching hairpin by sequence similarity
     best = {
-        "similarity": -1.0,
+        "similarity": -1.0,  # lower than any possible ratio() below, so the
+                              # first candidate always replaces this sentinel
         "hairpin": None,
         "chain_df": None,
         "handed": None,
@@ -353,11 +454,18 @@ def visualize_hairpin_handedness_from_cif_or_pdb(
         "matched_sequence": None,
     }
 
+    # A structure/chain can contain multiple candidate hairpins; DSSP-based
+    # detection alone can't tell which one corresponds to the hairpin of
+    # interest, so we score every candidate against the known true sequence
+    # and keep the closest match.
     for chain_id, s1s, s1e, s2s, s2e in hairpins:
         cdf = dssp_df[dssp_df["Chain"] == chain_id].reset_index(drop=True)
 
         # hairpin sequence from strand1 start to strand2 end
         hairpin_seq = "".join(cdf.loc[s1s:s2e, "AA"].tolist())
+        # difflib ratio(): normalized (0-1) fuzzy string-similarity score, used
+        # instead of exact matching to tolerate small differences (e.g.
+        # off-by-one strand-boundary detection).
         sim = SequenceMatcher(None, true_hairpin_seq, hairpin_seq).ratio()
 
         hand, mag = compute_handedness_from_structure(structure, cdf, s1e, s2s)
@@ -383,6 +491,12 @@ def visualize_hairpin_handedness_from_cif_or_pdb(
     arrows = get_handedness_vectors_from_structure(structure, cdf, s1e, s2s)
 
     # --- convert CIF → PDB string for py3Dmol visualization ---
+    # py3Dmol's addModel(..., "pdb") below only accepts PDB-format text, so
+    # the (possibly CIF-parsed) Structure object is re-serialized to PDB and
+    # read back in, regardless of whether the original input was CIF or PDB.
+    # NOTE: possible bug -- `PDBIO` is never imported in this file (only
+    # `PDB` and `DSSP` are imported from Bio.PDB at the top); this raises
+    # NameError: name 'PDBIO' is not defined. Likely meant `PDB.PDBIO()`.
     io = PDBIO()
     io.set_structure(structure)
     tmp_pdb = tempfile.NamedTemporaryFile(suffix=".pdb", delete=False).name
@@ -396,10 +510,14 @@ def visualize_hairpin_handedness_from_cif_or_pdb(
     view.setStyle({"cartoon": {"color": "lightgrey"}})
 
     # Color strands + loop
+    # s1s/s1e/s2s/s2e are positional (0-indexed, DataFrame-row) indices into
+    # cdf, not PDB residue numbers, so look up the actual ResNum values for
+    # py3Dmol's `resi` selector; +1 on each end index because slicing is
+    # exclusive of the stop but s1e/s2e are meant to be inclusive.
     resnums = cdf["ResNum"].tolist()
     s1_res = resnums[s1s:s1e + 1]
     s2_res = resnums[s2s:s2e + 1]
-    loop_res = resnums[s1e + 1:s2s]
+    loop_res = resnums[s1e + 1:s2s]  # residues strictly between the two strands
 
     for r in s1_res:
         view.setStyle({"resi": str(r)}, {"cartoon": {"color": "blue"}})
@@ -409,7 +527,10 @@ def visualize_hairpin_handedness_from_cif_or_pdb(
         view.setStyle({"resi": str(r)}, {"cartoon": {"color": "orange"}})
 
     # Add arrows
+    # (coordinates come back as numpy float32 scalars from Biopython; py3Dmol's
+    # JS-facing API needs plain JSON-serializable floats, hence float(...))
     def add_arrow(start, end, color):
+        """Draw a single py3Dmol arrow from `start` to `end` in the given color."""
         view.addArrow({
             "start": {"x": float(start[0]), "y": float(start[1]), "z": float(start[2])},
             "end":   {"x": float(end[0]),   "y": float(end[1]),   "z": float(end[2])},
@@ -417,6 +538,8 @@ def visualize_hairpin_handedness_from_cif_or_pdb(
             "radius": 0.25,
         })
 
+    # This blue/green/yellow legend is for the u/v/n geometry vectors only,
+    # independent of the blue/red strand-cartoon coloring set above.
     add_arrow(arrows["u"]["start"], arrows["u"]["end"], "blue")
     add_arrow(arrows["v"]["start"], arrows["v"]["end"], "green")
     add_arrow(arrows["n"]["start"], arrows["n"]["end"], "yellow")

@@ -46,6 +46,7 @@ from tqdm import tqdm
 from scipy import stats
 
 from transformers import EsmForProteinFolding, AutoTokenizer
+from src.utils.model_utils import load_esmfold
 from transformers.models.esm.modeling_esmfold import (
     categorical_lddt,
     EsmFoldingTrunk,
@@ -54,6 +55,8 @@ from transformers.models.esm.modeling_esmfold import (
 from transformers.models.esm.openfold_utils import make_atom14_masks
 from transformers.utils import ContextManagers
 
+# Reuse the DoM training/evaluation/plotting pipeline from charge_dom_training.py so this
+# script can (re)train charge directions itself when --directions_path isn't supplied.
 from src.charge_dom_training import (
     ChargeDirections, load_directions, save_directions,
     train_dom_vectors, evaluate_dom_vectors,
@@ -70,7 +73,7 @@ warnings.filterwarnings("ignore", message=".*mmCIF.*")
 # CONSTANTS
 # ============================================================================
 
-NUM_BLOCKS = 48
+NUM_BLOCKS = 48  # Depth of ESMFold's folding trunk (TrunkConfig.num_blocks)
 
 
 @dataclass
@@ -82,10 +85,12 @@ class HairpinTopology:
     turn_end: int
     strand2_start: int
     strand2_end: int
-    cross_strand_pairs: List[Tuple[int, int]]
+    cross_strand_pairs: List[Tuple[int, int]]  # (residue_i, residue_j) index pairs expected to H-bond across the two strands
 
 def save_structure_as_pdb(outputs: EsmForProteinFoldingOutput, model, path: str):
     """Save structure as PDB."""
+    # output_to_pdb expects a plain dict of raw tensors (not the EsmForProteinFoldingOutput
+    # dataclass); .detach() strips autograd bookkeeping before PDB-string conversion.
     clean = {
         "positions": outputs.positions.detach(),
         "aatype": outputs.aatype.detach(),
@@ -105,21 +110,24 @@ def save_structure_as_pdb(outputs: EsmForProteinFoldingOutput, model, path: str)
 
 def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
     """Standard forward pass collecting sequence representations."""
+    # Copy of transformers' EsmFoldingTrunk.forward, monkey-patched onto the trunk instance
+    # (see get_baseline_structure) so it can capture the per-block s activations (s_list)
+    # that the original HF implementation does not expose.
     device = seq_feats.device
-    s_s_0, s_z_0 = seq_feats, pair_feats
+    s_s_0, s_z_0 = seq_feats, pair_feats  # s_s_0: [B, L, 1024] sequence repr; s_z_0: [B, L, L, 128] pairwise repr
 
     if no_recycles is None:
         no_recycles = self.config.max_recycles
     else:
-        no_recycles = no_recycles + 1
+        no_recycles = no_recycles + 1  # +1 because the first pass counts as recycle iteration 0
 
     def trunk_iter(s, z, residx, mask):
-        z = z + self.pairwise_positional_embedding(residx, mask=mask)
+        z = z + self.pairwise_positional_embedding(residx, mask=mask)  # add relative sequence-position bias
         
         s_list = []
         for block in self.blocks:
             s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
-            s_list.append(s.detach().clone())
+            s_list.append(s.detach().clone())  # stash a detached copy of s after each of the 48 blocks
         return s, z, s_list
 
     s_s, s_z = s_s_0, s_z_0
@@ -129,6 +137,8 @@ def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, n
 
     for recycle_idx in range(no_recycles):
         with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
+            # Recycling: normalize last iteration's s/z and feed back in as an additive residual,
+            # plus a discretized inter-residue distance histogram (distogram) from predicted coords.
             recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
             recycle_z = self.recycle_z_norm(recycle_z.detach()).to(device)
             recycle_z += self.recycle_disto(recycle_bins.detach()).to(device)
@@ -143,13 +153,15 @@ def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, n
             )
             
             recycle_s, recycle_z = s_s, s_z
+            # Bin predicted CB-CB distances (final IPA iteration, 3.375-21.375 Å range) into
+            # self.recycle_bins buckets to feed into the next recycle round.
             recycle_bins = EsmFoldingTrunk.distogram(
                 structure["positions"][-1][:, :, :3], 3.375, 21.375, self.recycle_bins,
             )
 
     structure["s_s"] = s_s
     structure["s_z"] = s_z
-    structure["s_list"] = s_list
+    structure["s_list"] = s_list  # 48 per-block sequence reprs (each [B, L, 1024]) from the LAST recycle iteration
     structure["aatype"] = true_aa
     return structure
 
@@ -157,6 +169,8 @@ def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, n
 def baseline_forward(self, input_ids, attention_mask=None, position_ids=None,
                      masking_pattern=None, num_recycles=None, **kwargs):
     """Baseline forward pass."""
+    # Copy of EsmForProteinFolding.forward (up to the trunk call), monkey-patched alongside
+    # baseline_forward_trunk so both halves of the pipeline are instrumented consistently.
     cfg = self.config.esmfold_config
     aa = input_ids
     B, L = aa.shape
@@ -167,16 +181,17 @@ def baseline_forward(self, input_ids, attention_mask=None, position_ids=None,
     if position_ids is None:
         position_ids = torch.arange(L, device=device).expand_as(input_ids)
 
-    esmaa = self.af2_idx_to_esm_idx(aa, attention_mask)
-    esm_s = self.compute_language_model_representations(esmaa)
-    esm_s = esm_s.to(self.esm_s_combine.dtype).detach()
+    esmaa = self.af2_idx_to_esm_idx(aa, attention_mask)  # remap AF2 vocab ids -> ESM-2's own vocab ids
+    esm_s = self.compute_language_model_representations(esmaa)  # run ESM-2 encoder; stacks all layer hidden states
+    esm_s = esm_s.to(self.esm_s_combine.dtype).detach()  # cast to fp32, detach (ESM-2 backbone is frozen here)
+    # Learned softmax-weighted sum across ESM-2's layers -> single [B, L, esm_hidden_dim] representation
     esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2)
     
-    s_s_0 = self.esm_s_mlp(esm_s)
-    s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)
+    s_s_0 = self.esm_s_mlp(esm_s)  # project ESM-2 hidden dim -> trunk's sequence_state_dim (1024)
+    s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)  # pairwise repr starts at zero, shape [B, L, L, 128]
 
     if self.config.esmfold_config.embed_aa:
-        s_s_0 += self.embedding(aa)
+        s_s_0 += self.embedding(aa)  # optionally add a learned per-residue-identity embedding
 
     return self.trunk(s_s_0, s_z_0, aa, position_ids, attention_mask, no_recycles=num_recycles)
 
@@ -187,21 +202,26 @@ def intervention_forward_trunk(
     s_interventions: Optional[Dict[int, torch.Tensor]] = None,
 ):
     """Forward pass with s interventions at specified blocks."""
+    # Same monkey-patched copy of EsmFoldingTrunk.forward as baseline_forward_trunk, but here
+    # trunk_iter additively injects a precomputed steering vector into s right before each
+    # block in `intervention_blocks` runs (see run_intervention / create_hairpin_induction_interventions).
     device = seq_feats.device
-    s_s_0, s_z_0 = seq_feats, pair_feats
+    s_s_0, s_z_0 = seq_feats, pair_feats  # s_s_0: [B, L, 1024] sequence repr; s_z_0: [B, L, L, 128] pairwise repr
 
     if no_recycles is None:
         no_recycles = self.config.max_recycles
     else:
-        no_recycles = no_recycles + 1
+        no_recycles = no_recycles + 1  # +1 because the first pass counts as recycle iteration 0
 
     def trunk_iter(s, z, residx, mask):
-        z = z + self.pairwise_positional_embedding(residx, mask=mask)
+        z = z + self.pairwise_positional_embedding(residx, mask=mask)  # add relative sequence-position bias
         
         for block_idx, block in enumerate(self.blocks):
             # Apply s intervention before the block processes
             if block_idx in intervention_blocks:
                 if s_interventions is not None and block_idx in s_interventions:
+                    # s_interventions[block_idx]: [L, 1024] additive steering vector; unsqueeze(0)
+                    # broadcasts it to the [B, L, 1024] shape of s (added to every batch element).
                     s = s + s_interventions[block_idx].unsqueeze(0)
             
             s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
@@ -215,6 +235,8 @@ def intervention_forward_trunk(
 
     for recycle_idx in range(no_recycles):
         with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
+            # Recycling: normalize last iteration's s/z and feed back in as an additive residual,
+            # plus a discretized inter-residue distance histogram (distogram) from predicted coords.
             recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
             recycle_z = self.recycle_z_norm(recycle_z.detach()).to(device)
             recycle_z += self.recycle_disto(recycle_bins.detach()).to(device)
@@ -227,6 +249,8 @@ def intervention_forward_trunk(
             )
             
             recycle_s, recycle_z = s_s, s_z
+            # Bin predicted CB-CB distances (final IPA iteration, 3.375-21.375 Å range) into
+            # self.recycle_bins buckets to feed into the next recycle round.
             recycle_bins = EsmFoldingTrunk.distogram(
                 structure["positions"][-1][:, :, :3], 3.375, 21.375, self.recycle_bins,
             )
@@ -245,6 +269,8 @@ def intervention_forward(
     **kwargs
 ):
     """Forward pass with s interventions."""
+    # Copy of EsmForProteinFolding.forward, monkey-patched alongside intervention_forward_trunk
+    # (see run_intervention); threads intervention_blocks/s_interventions through to the trunk.
     cfg = self.config.esmfold_config
     aa = input_ids
     B, L = aa.shape
@@ -255,16 +281,17 @@ def intervention_forward(
     if position_ids is None:
         position_ids = torch.arange(L, device=device).expand_as(input_ids)
 
-    esmaa = self.af2_idx_to_esm_idx(aa, attention_mask)
-    esm_s = self.compute_language_model_representations(esmaa)
-    esm_s = esm_s.to(self.esm_s_combine.dtype).detach()
+    esmaa = self.af2_idx_to_esm_idx(aa, attention_mask)  # remap AF2 vocab ids -> ESM-2's own vocab ids
+    esm_s = self.compute_language_model_representations(esmaa)  # run ESM-2 encoder; stacks all layer hidden states
+    esm_s = esm_s.to(self.esm_s_combine.dtype).detach()  # cast to fp32, detach (ESM-2 backbone is frozen here)
+    # Learned softmax-weighted sum across ESM-2's layers -> single [B, L, esm_hidden_dim] representation
     esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2)
     
-    s_s_0 = self.esm_s_mlp(esm_s)
-    s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)
+    s_s_0 = self.esm_s_mlp(esm_s)  # project ESM-2 hidden dim -> trunk's sequence_state_dim (1024)
+    s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)  # pairwise repr starts at zero, shape [B, L, L, 128]
 
     if self.config.esmfold_config.embed_aa:
-        s_s_0 += self.embedding(aa)
+        s_s_0 += self.embedding(aa)  # optionally add a learned per-residue-identity embedding
 
     return self.trunk(
         s_s_0, s_z_0, aa, position_ids, attention_mask, no_recycles=num_recycles,
@@ -279,19 +306,23 @@ def intervention_forward(
 
 def compute_cb_distances(positions: torch.Tensor) -> torch.Tensor:
     """Compute Cβ-Cβ distances from atom positions."""
+    # positions: [L, 14, 3] atom14-format coordinates (order: N, CA, C, O, CB, ...; see
+    # openfold_utils.residue_constants.restype_name_to_atom14_names).
     L = positions.shape[0]
+    # NOTE: possible bug -- atom14 index 3 is the backbone carbonyl O, not CB (CB is index 4).
+    # This function may actually be computing O-O distances instead of CB-CB distances.
     CB_IDX, CA_IDX = 3, 1
     
     cb_coords = []
     for i in range(L):
         cb = positions[i, CB_IDX]
         if torch.norm(cb) < 0.1:
-            cb = positions[i, CA_IDX]
+            cb = positions[i, CA_IDX]  # glycine has no CB (zero-filled placeholder); fall back to CA as a pseudo-CB
         cb_coords.append(cb)
     cb_coords = torch.stack(cb_coords)
     
-    diff = cb_coords.unsqueeze(0) - cb_coords.unsqueeze(1)
-    distances = torch.norm(diff, dim=-1)
+    diff = cb_coords.unsqueeze(0) - cb_coords.unsqueeze(1)  # pairwise differences via broadcasting: [L, L, 3]
+    distances = torch.norm(diff, dim=-1)  # [L, L] pairwise distance matrix
     return distances
 
 
@@ -302,9 +333,11 @@ def define_hairpin_topology(
 ) -> HairpinTopology:
     """Define a hypothetical hairpin topology for a region."""
     region_length = region_end - region_start
-    strand_length = (region_length - turn_length) // 2
+    strand_length = (region_length - turn_length) // 2  # split region into two equal strands + a turn
     
     if strand_length < 3:
+        # Guard against degenerate/too-short regions: enforce a minimum strand length of 3
+        # residues (need a few residues to call it a "strand"), shrinking the turn to compensate.
         strand_length = 3
         turn_length = max(2, region_length - 2 * strand_length)
     
@@ -319,10 +352,13 @@ def define_hairpin_topology(
     actual_strand2_len = strand2_end - strand2_start
     actual_strand1_len = strand1_end - strand1_start
     
+    # Antiparallel pairing register: residue i of strand1 pairs with the mirrored residue
+    # counting backward from the end of strand2 (first-of-strand1 <-> last-of-strand2, etc.),
+    # matching how real antiparallel beta sheets hydrogen-bond across strands.
     for i in range(min(actual_strand1_len, actual_strand2_len)):
         res_i = strand1_start + i
         res_j = strand2_end - 1 - i
-        if res_j >= strand2_start:
+        if res_j >= strand2_start:  # guard against out-of-range pairing when strands are unequal length
             cross_strand_pairs.append((res_i, res_j))
     
     return HairpinTopology(
@@ -357,7 +393,7 @@ def get_sliding_window_block_sets(
     
     for start_block in range(total_blocks - window_size + 1):
         end_block = start_block + window_size - 1
-        name = f'w{window_size}_blocks_{start_block}_to_{end_block}'
+        name = f'w{window_size}_blocks_{start_block}_to_{end_block}'  # format is re-parsed later via block_set_name.split('_')
         blocks = set(range(start_block, start_block + window_size))
         block_sets.append((name, blocks))
     
@@ -366,12 +402,14 @@ def get_sliding_window_block_sets(
 
 def get_baseline_structure(model, seq: str, tokenizer, device: str) -> EsmForProteinFoldingOutput:
     """Run baseline forward pass and return structure outputs."""
+    # Monkey-patch in the instrumented forward pass that exposes s_list (re-patched fresh on
+    # every call, so no explicit "unpatch" step is needed; contrast with run_intervention below).
     model.forward = types.MethodType(baseline_forward, model)
     model.trunk.forward = types.MethodType(baseline_forward_trunk, model.trunk)
     
     with torch.no_grad():
         inputs = tokenizer(seq, return_tensors='pt', add_special_tokens=False).to(device)
-        outputs = model(**inputs, num_recycles=0)
+        outputs = model(**inputs, num_recycles=0)  # single pass, no iterative recycling
     
     L = len(seq)
     B = 1
@@ -384,9 +422,11 @@ def get_baseline_structure(model, seq: str, tokenizer, device: str) -> EsmForPro
         "s_z": outputs["s_z"],
     }
     
-    make_atom14_masks(structure)
+    make_atom14_masks(structure)  # mutates `structure` in place, adding atom14_atom_exists / residx_atom14_to_atom37 / etc.
     structure["residue_index"] = torch.arange(L, device=device).unsqueeze(0)
     
+    # The trunk-only call above skips the model's own plddt computation, so replicate it here:
+    # run the per-residue confidence (lDDT) head and convert its binned logits to a scalar score.
     lddt_head = model.lddt_head(structure["states"]).reshape(
         structure["states"].shape[0], B, L, -1, model.lddt_bins
     )
@@ -394,8 +434,10 @@ def get_baseline_structure(model, seq: str, tokenizer, device: str) -> EsmForPro
     plddt = categorical_lddt(lddt_head[-1], bins=model.lddt_bins)
     structure["plddt"] = plddt
     
-    s_list = outputs.get("s_list")
+    s_list = outputs.get("s_list")  # per-block sequence reprs captured by baseline_forward_trunk (not in default HF output)
     
+    # Re-wrap into the standard EsmForProteinFoldingOutput dataclass so downstream code (e.g.
+    # save_structure_as_pdb) can treat this the same as a normal model output.
     output = EsmForProteinFoldingOutput(
         positions=structure["positions"],
         states=structure["states"],
@@ -411,7 +453,7 @@ def get_baseline_structure(model, seq: str, tokenizer, device: str) -> EsmForPro
         plddt=structure["plddt"],
     )
     
-    output.s_list = s_list
+    output.s_list = s_list  # attach as a dynamic extra attribute (not a declared dataclass field)
     
     return output
 
@@ -422,13 +464,16 @@ def run_intervention(
     s_interventions: Optional[Dict[int, torch.Tensor]] = None,
 ) -> EsmForProteinFoldingOutput:
     """Run forward pass with s intervention."""
+    # Monkey-patch in the steering-capable forward pass (re-patched fresh on every call, so no
+    # explicit "unpatch" step is needed even though get_baseline_structure patches different
+    # functions onto the same model instance in between calls).
     model.forward = types.MethodType(intervention_forward, model)
     model.trunk.forward = types.MethodType(intervention_forward_trunk, model.trunk)
     
     with torch.no_grad():
         inputs = tokenizer(seq, return_tensors='pt', add_special_tokens=False).to(device)
         outputs = model(
-            **inputs, num_recycles=0,
+            **inputs, num_recycles=0,  # single pass, no iterative recycling
             intervention_blocks=intervention_blocks,
             s_interventions=s_interventions,
         )
@@ -444,9 +489,10 @@ def run_intervention(
         "s_z": outputs["s_z"],
     }
     
-    make_atom14_masks(structure)
+    make_atom14_masks(structure)  # mutates `structure` in place, adding atom14_atom_exists / residx_atom14_to_atom37 / etc.
     structure["residue_index"] = torch.arange(L, device=device).unsqueeze(0)
     
+    # Replicate the model's plddt computation, which the trunk-only call above skips.
     lddt_head = model.lddt_head(structure["states"]).reshape(
         structure["states"].shape[0], B, L, -1, model.lddt_bins
     )
@@ -454,6 +500,8 @@ def run_intervention(
     plddt = categorical_lddt(lddt_head[-1], bins=model.lddt_bins)
     structure["plddt"] = plddt
     
+    # Re-wrap into the standard output dataclass (no s_list here: intervention_forward_trunk
+    # doesn't capture per-block activations the way baseline_forward_trunk does).
     output = EsmForProteinFoldingOutput(
         positions=structure["positions"],
         states=structure["states"],
@@ -493,7 +541,7 @@ def create_hairpin_induction_interventions(
         polarity: 'pos_neg' = positive charge on strand1, negative on strand2 (original)
                   'neg_pos' = negative charge on strand1, positive on strand2 (reversed)
     """
-    s_interventions = {}
+    s_interventions = {}  # block_idx -> [seq_len, 1024] additive steering tensor (zero outside the two strand windows)
     
     if polarity == 'pos_neg':
         strand1_sign = +1.0
@@ -506,19 +554,23 @@ def create_hairpin_induction_interventions(
     
     for block in blocks:
         if block not in directions.s_directions:
-            continue
+            continue  # no trained DoM direction for this block (e.g. not covered during training)
         
-        s_dir = directions.s_directions[block]
-        s_std = directions.s_stds[block]
+        s_dir = directions.s_directions[block]  # unit-norm DoM charge direction for this block
+        s_std = directions.s_stds[block]  # natural activation std along that direction (see charge_dom_training.py)
         
         s_int = torch.zeros(seq_len, len(s_dir), dtype=torch.float32, device=device)
-        delta = magnitude * s_std * s_dir
+        delta = magnitude * s_std * s_dir  # perturbation of `magnitude` std-devs along the charge direction
         
         # Apply charge to strand1
+        # (every residue in strand1's window gets the same +/-delta vector added to its s
+        # representation -- this is the "complementary charge" steering signal)
         for i in range(topology.strand1_start, topology.strand1_end):
             s_int[i] = torch.tensor(strand1_sign * delta, device=device)
         
         # Apply charge to strand2
+        # (opposite sign from strand1, so the two future strands look oppositely charged to
+        # the model -- the hypothesized cross-strand contact signal)
         for j in range(topology.strand2_start, topology.strand2_end):
             s_int[j] = torch.tensor(strand2_sign * delta, device=device)
         
@@ -542,10 +594,11 @@ def compute_rg_from_positions(outputs: EsmForProteinFoldingOutput) -> float:
         Radius of gyration in Angstroms, or NaN if insufficient atoms
     """
     CA_IDX = 1
-    positions = outputs.positions[-1, 0].cpu()  # [L, 14, 3]
+    positions = outputs.positions[-1, 0].cpu()  # [L, 14, 3]  ([-1]: final structure-module iteration, [0]: only batch element)
     ca_coords = positions[:, CA_IDX, :]  # [L, 3]
 
     # Filter out zero/missing coordinates
+    # (padding/unresolved residues are zero-filled placeholders)
     valid_mask = ca_coords.norm(dim=-1) > 0.1
     ca_coords = ca_coords[valid_mask]
 
@@ -562,8 +615,8 @@ def compute_cross_strand_distances(
     topology: HairpinTopology,
 ) -> Dict[str, float]:
     """Compute distances for cross-strand pairs."""
-    positions = outputs.positions[-1, 0].cpu()
-    distances = compute_cb_distances(positions)
+    positions = outputs.positions[-1, 0].cpu()  # [L, 14, 3] atom14 coords, final structure-module iteration
+    distances = compute_cb_distances(positions)  # [L, L] pairwise CB-CB (see NOTE in compute_cb_distances)
     
     cross_strand_dists = []
     for i, j in topology.cross_strand_pairs:
@@ -573,7 +626,7 @@ def compute_cross_strand_distances(
         'mean_cross_strand_dist': np.mean(cross_strand_dists) if cross_strand_dists else None,
         'min_cross_strand_dist': np.min(cross_strand_dists) if cross_strand_dists else None,
         'max_cross_strand_dist': np.max(cross_strand_dists) if cross_strand_dists else None,
-        'n_contacts': sum(1 for d in cross_strand_dists if d < 8.0),
+        'n_contacts': sum(1 for d in cross_strand_dists if d < 8.0),  # 8 Å: conventional CB-CB residue-contact distance cutoff
         'n_pairs': len(cross_strand_dists),
     }
 
@@ -603,15 +656,17 @@ def compute_backbone_hbonds(
     C_IDX = 2   # Backbone carbonyl carbon
     O_IDX = 3   # Backbone carbonyl oxygen
     
-    positions = outputs.positions[-1, 0].cpu()
+    positions = outputs.positions[-1, 0].cpu()  # [L, 14, 3] atom14 coords, final structure-module iteration
     
     hbond_count = 0
     hbond_pairs = []
     no_distances = []
     
+    # Distance-only heuristic for backbone H-bonds (real H-bond geometry also depends on bond
+    # angles, which aren't checked here).
     for i, j in topology.cross_strand_pairs:
         n_i = positions[i, N_IDX]
-        o_i = positions[i, O_IDX] if positions[i, O_IDX].norm() > 0.1 else positions[i, C_IDX]
+        o_i = positions[i, O_IDX] if positions[i, O_IDX].norm() > 0.1 else positions[i, C_IDX]  # fall back to C if O is unresolved/missing
         n_j = positions[j, N_IDX]
         o_j = positions[j, O_IDX] if positions[j, O_IDX].norm() > 0.1 else positions[j, C_IDX]
         
@@ -628,7 +683,7 @@ def compute_backbone_hbonds(
             hbond_count += 1
             hbond_pairs.append((j, i, 'N_j-O_i', dist_nj_oi))
     
-    max_possible_hbonds = 2 * len(topology.cross_strand_pairs)
+    max_possible_hbonds = 2 * len(topology.cross_strand_pairs)  # each cross-strand pair can form up to 2 H-bonds (N_i-O_j and N_j-O_i)
     hbond_fraction = hbond_count / max_possible_hbonds if max_possible_hbonds > 0 else 0
     
     return {
@@ -650,6 +705,7 @@ class ResultsManager:
     """Manages incremental saving of results."""
     
     def __init__(self, output_path: str, output_dir: str, save_every: int = 10):
+        """Initialize an empty results buffer that checkpoints to disk every `save_every` cases."""
         self.output_path = output_path
         self.output_dir = output_dir
         self.save_every = save_every
@@ -657,14 +713,17 @@ class ResultsManager:
         self.cases_processed = 0
     
     def add_results(self, new_results: List[Dict]):
+        """Append newly computed result rows (one dict per row) to the in-memory buffer."""
         self.results.extend(new_results)
     
     def mark_case_done(self):
+        """Increment the processed-case counter and checkpoint-save every `save_every` cases."""
         self.cases_processed += 1
         if self.cases_processed % self.save_every == 0:
             self.save()
     
     def save(self):
+        """Write all buffered results to parquet and refresh the summary plots (best-effort)."""
         if len(self.results) == 0:
             return
         df = pd.DataFrame(self.results)
@@ -672,11 +731,13 @@ class ResultsManager:
         print(f"\n[Checkpoint] Saved {len(self.results)} results after {self.cases_processed} cases")
         
         try:
+            # Plotting failures shouldn't kill a long-running experiment; just warn and continue.
             analyze_results(df, self.output_dir)
         except Exception as e:
             print(f"[Warning] Could not update plots: {e}")
     
     def get_dataframe(self) -> pd.DataFrame:
+        """Return all buffered results as a DataFrame."""
         return pd.DataFrame(self.results)
 
 
@@ -715,7 +776,7 @@ def run_hairpin_induction_experiment(
         save_every=save_every
     )
     
-    available_blocks = set(directions.s_directions.keys())
+    available_blocks = set(directions.s_directions.keys())  # blocks that actually have a trained DoM direction
     
     if save_pdbs:
         pdb_dir = os.path.join(output_dir, 'induced_hairpins')
@@ -807,9 +868,9 @@ def run_hairpin_induction_experiment(
         # Precompute valid block sets
         valid_block_sets = []
         for block_set_name, intervention_blocks in block_sets:
-            ib = intervention_blocks & available_blocks
+            ib = intervention_blocks & available_blocks  # restrict window to blocks with a trained direction
             if len(ib) > 0:
-                valid_block_sets.append((block_set_name, ib))
+                valid_block_sets.append((block_set_name, ib))  # drop windows left with no usable blocks
         
         n_total = len(valid_block_sets) * len(magnitudes) * 2  # x2 for both polarities
         pbar = tqdm(total=n_total, desc=f"Case {case_idx}", leave=False)
@@ -818,7 +879,7 @@ def run_hairpin_induction_experiment(
         
         for block_set_name, intervention_blocks in valid_block_sets:
             # Extract window info from name (format: w{size}_blocks_{start}_to_{end})
-            parts = block_set_name.split('_')
+            parts = block_set_name.split('_')  # ['w{size}', 'blocks', '{start}', 'to', '{end}']
             window_size = int(parts[0][1:])  # Remove 'w' prefix
             window_start = int(parts[2])
             window_end = int(parts[4])
@@ -855,6 +916,9 @@ def run_hairpin_induction_experiment(
                     int_rg = compute_rg_from_positions(int_outputs)
 
                     # Compute Rg ratio and apply filter
+                    # Rg ratio is a structural sanity check: if the intervention makes the protein
+                    # collapse (much smaller Rg than baseline), any apparent H-bond gain is likely a
+                    # folding artifact rather than a genuine induced hairpin, so it gets flagged below.
                     rg_ratio = int_rg / baseline_rg if (baseline_rg and not np.isnan(baseline_rg) and baseline_rg > 0) else float('nan')
                     rg_filtered = (np.isnan(rg_ratio)) or (rg_ratio < rg_ratio_threshold)
 
@@ -866,6 +930,8 @@ def run_hairpin_induction_experiment(
                     hbond_change = int_hbonds['n_hbonds'] - baseline_hbonds['n_hbonds']
 
                     # Zero out hbond results if Rg filter fails (structure collapsed)
+                    # (rows are kept, not dropped, so the dataframe schema stays consistent for
+                    # aggregate plotting, but the reported H-bond signal is treated as "no induced hairpin")
                     reported_hbond_percentage = 0.0 if rg_filtered else int_hbonds['hbond_percentage']
                     reported_n_hbonds = 0 if rg_filtered else int_hbonds['n_hbonds']
                     reported_hbond_change = reported_n_hbonds - baseline_hbonds['n_hbonds']
@@ -929,7 +995,7 @@ def run_hairpin_induction_experiment(
                             )
                 
                     del s_ints, int_outputs
-                    torch.cuda.empty_cache()
+                    torch.cuda.empty_cache()  # free GPU memory every iteration; this inner loop runs many times per case
                     
                     pbar.update(1)
         
@@ -963,7 +1029,7 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
     print(f"Interventions: {len(interventions)} total")
 
     if 'rg_filtered' in interventions.columns:
-        n_filtered = interventions['rg_filtered'].sum()
+        n_filtered = interventions['rg_filtered'].sum()  # sum of a boolean column = count of True values
         print(f"  Rg-filtered (zeroed hbond): {n_filtered}/{len(interventions)} "
               f"({100*n_filtered/len(interventions):.1f}%)")
 
@@ -978,10 +1044,15 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
     polarities = sorted([p for p in interventions['polarity'].unique()])
 
     # Color maps
+    # (assign each window size / magnitude a distinct color sampled from a colormap; max(1, n-1)
+    # avoids division by zero when there's only one value; scaling by 0.8 keeps samples away
+    # from the washed-out bright end of the colormap)
     n_window_sizes = len(window_sizes)
     n_magnitudes = len(magnitudes)
     ws_colors = {ws: plt.cm.viridis(i / max(1, n_window_sizes - 1) * 0.8)
                  for i, ws in enumerate(window_sizes)}
+    # NOTE: possible bug -- mag_colors is computed but never used; every plot below (including
+    # the by-magnitude subplot) colors series by window size (ws_colors) instead.
     mag_colors = {mag: plt.cm.plasma(i / max(1, n_magnitudes - 1) * 0.8)
                   for i, mag in enumerate(magnitudes)}
 
@@ -991,6 +1062,10 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
     # =========================================================================
     # Single summary plot with Rg-filtered data
     # =========================================================================
+    # The four panels below share a common pattern: group intervention rows by
+    # (window_size, polarity), aggregate a metric's mean (+ SEM where applicable) per
+    # window_start/magnitude, and plot one line per (window_size, polarity) combination,
+    # with a dashed gray baseline reference line for comparison.
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     # --- Top-left: H-bond formation (Rg-filtered) by window start ---
@@ -1013,7 +1088,7 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
                         valid_starts.append(wstart)
 
                 if len(means) > 0:
-                    ax.fill_between(valid_starts, means, color=ws_colors[ws], alpha=0.15)
+                    ax.fill_between(valid_starts, means, color=ws_colors[ws], alpha=0.15)  # shaded area under the curve (down to y=0), purely stylistic -- not an error band
                     ax.errorbar(valid_starts, means, yerr=sems,
                                fmt='o', linestyle=polarity_linestyles[pol],
                                label=f'w={ws} {polarity_labels[pol]}', color=ws_colors[ws],
@@ -1081,7 +1156,7 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
                     dist_changes = subset['dist_change'].dropna()
                     if len(dist_changes) > 0:
                         means.append(dist_changes.mean())
-                        stds.append(dist_changes.std() / np.sqrt(len(dist_changes)) if len(dist_changes) > 1 else 0)
+                        stds.append(dist_changes.std() / np.sqrt(len(dist_changes)) if len(dist_changes) > 1 else 0)  # manual SEM, equivalent to .sem() used in the other panels
                         valid_starts.append(wstart)
 
             if len(means) > 0:
@@ -1110,6 +1185,10 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
                         (interventions['magnitude'] == mag) &
                         (interventions['polarity'] == pol)
                     ]
+                    # NOTE: possible bug -- unlike the other three panels (which skip a point
+                    # entirely when no data exists), this defaults to 0 for an untested/missing
+                    # (ws, mag, pol) combination, which can visually read as "no H-bonds formed"
+                    # rather than "not tested".
                     mean_hbond = subset['hbond_percentage'].mean() if len(subset) > 0 else 0
                     means.append(mean_hbond)
 
@@ -1141,6 +1220,7 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
 
 
 def parse_args():
+    """Parse command-line arguments for the charge-steering hairpin induction experiment."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--probing_dataset', type=str,
                         default=os.path.join(_PROJECT_ROOT, 'data', 'probing_train_test.csv'),
@@ -1167,6 +1247,8 @@ def parse_args():
 
 
 def main():
+    """CLI entry point: (re)train or load DoM charge directions, then run the sliding-window
+    charge-steering hairpin induction experiment and analyze/plot the results."""
     args = parse_args()
     
     os.makedirs(args.output, exist_ok=True)
@@ -1177,9 +1259,7 @@ def main():
     print(f"Using device: {device}")
 
     # Load model
-    print("\nLoading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    model, tokenizer = load_esmfold(device)
 
     # Blocks to train/evaluate
     blocks_to_use = list(range(0, 48))
@@ -1188,6 +1268,8 @@ def main():
     # PHASE 1: Load or Train DoM Vectors
     # =========================================================================
     if args.directions_path and os.path.exists(args.directions_path):
+        # Reuse a precomputed DoM checkpoint if one was given and actually exists on disk;
+        # otherwise fall through to train fresh directions from --probing_dataset below.
         print(f"\nLoading DoM directions from {args.directions_path}...")
         directions = load_directions(args.directions_path)
         print(f"Loaded directions for {len(directions.s_directions)} blocks")
@@ -1213,6 +1295,9 @@ def main():
         # =====================================================================
         # TRAINING: Use only alpha_helical sequences from train split
         # =====================================================================
+        # Restrict to alpha_helical sequences: interventions later in this script are applied to
+        # helical (non-hairpin) sequences, so training on the same population keeps the learned
+        # direction's statistics representative of the eventual intervention target domain.
         train_df = probing_df[
             (probing_df['split'] == 'train') &
             (probing_df['structure_type'] == 'alpha_helical')
@@ -1248,6 +1333,8 @@ def main():
         print("PHASE 1b: EVALUATE DoM VECTORS")
         print("="*60)
 
+        # Unlike training, evaluation uses the ENTIRE test split (all structure_types) to check
+        # how well the direction generalizes beyond the alpha_helical training population.
         test_df = probing_df[probing_df['split'] == 'test']
         seq_col = 'FullChainSequence' if 'FullChainSequence' in test_df.columns else 'sequence'
         test_seqs = test_df[seq_col].tolist()
@@ -1311,6 +1398,7 @@ def main():
         return
     
     # Set up sliding window block sets for all window sizes
+    # (flatten into one list of (name, block_set) tuples spanning every requested window size)
     all_block_sets = []
     for window_size in args.window_sizes:
         block_sets = get_sliding_window_block_sets(

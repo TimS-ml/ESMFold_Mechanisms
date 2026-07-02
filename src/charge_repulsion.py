@@ -45,6 +45,7 @@ from tqdm import tqdm
 from scipy import stats
 
 from transformers import EsmForProteinFolding, AutoTokenizer
+from src.utils.model_utils import load_esmfold
 from transformers.models.esm.modeling_esmfold import (
     categorical_lddt,
     EsmFoldingTrunk,
@@ -65,20 +66,26 @@ from src.charge_dom_training import (
 )
 import warnings
 
+# Silence a noisy Biopython/mmCIF parser warning; this script itself never parses mmCIF
+# files, but load_esmfold/downstream utilities may, so the filter is kept as a precaution.
 warnings.filterwarnings("ignore", message="parse error at line.*mmCIF")
 
 # ============================================================================
 # CONSTANTS
 # ============================================================================
 
+# Number of folding-trunk blocks in ESMFold (matches EsmFoldConfig.trunk.num_blocks)
 NUM_BLOCKS = 48
 
 # Intervention type configurations (s-only for this experiment)
+# Maps a config name -> list of representations to intervene on. Only 's' (sequence
+# repr) is supported here, unlike other experiments in this repo that also patch 'z'.
 INTERVENTION_CONFIGS = {
     's': ['s'],
 }
 
 # Charge modes for disruption
+# Each tuple is (strand1_sign, strand2_sign) applied along the trained charge direction.
 CHARGE_MODES = {
     'both_positive': (+1, +1),   # Both strands get positive charge signal
     'both_negative': (-1, -1),   # Both strands get negative charge signal
@@ -86,6 +93,8 @@ CHARGE_MODES = {
 }
 
 # Block sweep modes
+# NOTE: documentation only -- the argparse `choices` list in parse_args() hardcodes
+# these same keys separately and must be kept in sync manually.
 BLOCK_SWEEP_MODES = {
     'single': 'Intervene at single block only',
     'cumulative_forward': 'Intervene at block X and all blocks after',
@@ -94,7 +103,8 @@ BLOCK_SWEEP_MODES = {
     'all': 'Intervene at all blocks (no sweep)',
 }
 
-# H-bond distance threshold (Angstroms)
+# H-bond distance threshold (Angstroms) -- ~3.5 Å is the conventional N···O distance
+# cutoff used as a geometric proxy for a backbone hydrogen bond.
 HBOND_DISTANCE_THRESHOLD = 3.5
 
 
@@ -111,6 +121,7 @@ class HairpinTopology:
     turn_end: int
     strand2_start: int
     strand2_end: int
+    # Antiparallel residue pairings between strand1 and strand2 (see define_hairpin_topology)
     cross_strand_pairs: List[Tuple[int, int]]
 
 
@@ -121,32 +132,44 @@ class HairpinTopology:
 def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
     """Standard forward pass collecting representations including seq2pair."""
     device = seq_feats.device
-    s_s_0, s_z_0 = seq_feats, pair_feats
+    s_s_0, s_z_0 = seq_feats, pair_feats  # s_s_0: [1, L, 1024] seq repr; s_z_0: [1, L, L, 128] pair repr
 
     if no_recycles is None:
         no_recycles = self.config.max_recycles
     else:
+        # HF convention: the requested value is extra recycles on top of one mandatory pass
         no_recycles = no_recycles + 1
 
     def trunk_iter(s, z, residx, mask):
+        """Run one full pass through all 48 trunk blocks, returning final s/z plus per-block probing lists."""
         z = z + self.pairwise_positional_embedding(residx, mask=mask)
         
         s_list, z_list, seq2pair_list = [], [], []
         for block in self.blocks:
+            # Recompute the block's sequence->pair projection from the pre-update, layer-normed
+            # s purely to record it for probing. This is an approximation of the block's real
+            # internal seq2pair term, which is instead computed from s *after* self-attention
+            # updates it (see EsmFoldTriangularSelfAttentionBlock.forward); it is not fed into z
+            # here and is unused elsewhere in this script beyond being attached to the output.
             seq2pair_out = block.sequence_to_pair(block.layernorm_1(s))
             seq2pair_list.append(seq2pair_out.detach().clone())
             
             s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
+            # Cache detached per-block copies of s/z (48 blocks) for downstream probing/analysis
             s_list.append(s.detach().clone())
             z_list.append(z.detach().clone())
         return s, z, s_list, z_list, seq2pair_list
 
     s_s, s_z = s_s_0, s_z_0
+    # Recycled state accumulators: start at zero for the first pass (standard AlphaFold-style recycling)
     recycle_s = torch.zeros_like(s_s)
     recycle_z = torch.zeros_like(s_z)
-    recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
+    recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)  # [1, L, L] "unknown" distance bin (0)
 
     for recycle_idx in range(no_recycles):
+        # Only the last recycle iteration retains gradients; earlier iterations run under
+        # no_grad since their outputs are immediately detached into `recycle_s`/`recycle_z`
+        # anyway (matches the original ESMFold trunk implementation).
         with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
             recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
             recycle_z = self.recycle_z_norm(recycle_z.detach()).to(device)
@@ -156,16 +179,21 @@ def baseline_forward_trunk(self, seq_feats, pair_feats, true_aa, residx, mask, n
                 s_s_0 + recycle_s, s_z_0 + recycle_z, residx, mask
             )
             
+            # Project trunk dims -> structure-module dims and predict 3D atom14 coordinates
             structure = self.structure_module(
                 {"single": self.trunk2sm_s(s_s), "pair": self.trunk2sm_z(s_z)},
                 true_aa, mask.float(),
             )
             
             recycle_s, recycle_z = s_s, s_z
+            # Infer pseudo-Cβ coords from predicted N/CA/C (positions[..., :3]) and discretize
+            # pairwise distances into `recycle_bins` (15) bins spanning 3.375-21.375 Å (squared
+            # distance boundaries) to feed back into the next recycle iteration via recycle_disto.
             recycle_bins = EsmFoldingTrunk.distogram(
                 structure["positions"][-1][:, :, :3], 3.375, 21.375, self.recycle_bins,
             )
 
+    # Attach final representations + per-block probing data (see trunk_iter) for the caller
     structure["s_s"] = s_s
     structure["s_z"] = s_z
     structure["s_list"] = s_list
@@ -188,16 +216,17 @@ def baseline_forward(self, input_ids, attention_mask=None, position_ids=None,
     if position_ids is None:
         position_ids = torch.arange(L, device=device).expand_as(input_ids)
 
-    esmaa = self.af2_idx_to_esm_idx(aa, attention_mask)
-    esm_s = self.compute_language_model_representations(esmaa)
+    esmaa = self.af2_idx_to_esm_idx(aa, attention_mask)  # AF2 token ids -> ESM-2 vocabulary ids
+    esm_s = self.compute_language_model_representations(esmaa)  # run 36-layer ESM-2 encoder: [1, L, 37, esm_dim] (all hidden layers incl. embeddings)
     esm_s = esm_s.to(self.esm_s_combine.dtype).detach()
+    # Learned softmax-weighted sum over ESM-2 layers -> single per-residue embedding [1, L, esm_dim]
     esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2)
     
-    s_s_0 = self.esm_s_mlp(esm_s)
-    s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)
+    s_s_0 = self.esm_s_mlp(esm_s)  # project down to trunk width -> [1, L, 1024] initial sequence repr
+    s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)  # [1, L, L, 128] pair repr, starts at zero
 
     if self.config.esmfold_config.embed_aa:
-        s_s_0 += self.embedding(aa)
+        s_s_0 += self.embedding(aa)  # optionally add a learned per-amino-acid embedding
 
     return self.trunk(s_s_0, s_z_0, aa, position_ids, attention_mask, no_recycles=num_recycles)
 
@@ -217,12 +246,18 @@ def intervention_forward_trunk(
         no_recycles = no_recycles + 1
 
     def trunk_iter(s, z, residx, mask):
+        """Run one full pass through all 48 trunk blocks, applying s-interventions at the specified blocks."""
         z = z + self.pairwise_positional_embedding(residx, mask=mask)
         
         for block_idx, block in enumerate(self.blocks):
             # Apply s intervention before block processes it
             if block_idx in intervention_blocks:
                 if s_interventions is not None and block_idx in s_interventions:
+                    # Core causal intervention: additively inject the per-position charge-signal
+                    # offset (built in create_hairpin_disruption_interventions) into s just before
+                    # this block runs. unsqueeze(0) adds the batch dim to match s's [1, L, 1024]
+                    # shape. If intervention_blocks spans multiple blocks, this fires at each one,
+                    # so the same directional push is re-applied every block in the set.
                     s = s + s_interventions[block_idx].unsqueeze(0)
             
             s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
@@ -234,6 +269,8 @@ def intervention_forward_trunk(
     recycle_z = torch.zeros_like(s_z)
     recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
 
+    # Recycling loop mirrors baseline_forward_trunk above (same normalize/embed/structure/distogram
+    # steps); the only difference is trunk_iter applies the s-interventions each pass.
     for recycle_idx in range(no_recycles):
         with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
             recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
@@ -266,6 +303,8 @@ def intervention_forward(
     **kwargs
 ):
     """Forward pass with s-only interventions."""
+    # Identical to baseline_forward above (ESM-2 encoding -> combine layers -> project to s_s_0/s_z_0);
+    # the only difference is passing intervention_blocks/s_interventions through to the trunk.
     cfg = self.config.esmfold_config
     aa = input_ids
     B, L = aa.shape
@@ -289,7 +328,7 @@ def intervention_forward(
 
     return self.trunk(
         s_s_0, s_z_0, aa, position_ids, attention_mask, no_recycles=num_recycles,
-        intervention_blocks=intervention_blocks or set(),
+        intervention_blocks=intervention_blocks or set(),  # default to "no blocks" if not provided
         s_interventions=s_interventions,
     )
 
@@ -300,19 +339,27 @@ def intervention_forward(
 
 def compute_cb_distances(positions: torch.Tensor) -> torch.Tensor:
     """Compute Cβ-Cβ distances from atom positions."""
+    # positions: [L, 14, 3] atom14-format coordinates for one chain (N=0, CA=1, C=2, O=3, CB=4, ...)
     L = positions.shape[0]
+    # NOTE: possible bug -- atom14 ordering (per openfold_utils residue_constants) is
+    # N=0, CA=1, C=2, O=3, CB=4, so index 3 is the backbone O atom, not CB. CB_IDX should
+    # likely be 4. As written, this computes O···O pseudo-distances (mislabeled as Cβ-Cβ),
+    # and the `< 0.1` fallback below almost never triggers for O (which is essentially never
+    # at the origin), so it doesn't correctly cover Gly (which truly lacks a CB atom).
     CB_IDX, CA_IDX = 3, 1
     
     cb_coords = []
     for i in range(L):
         cb = positions[i, CB_IDX]
+        # Atoms absent for a residue type are zero-padded in atom14; norm ~ 0 flags "missing"
+        # (intended for Gly, which has no CB) and falls back to CA instead.
         if torch.norm(cb) < 0.1:
             cb = positions[i, CA_IDX]
         cb_coords.append(cb)
     cb_coords = torch.stack(cb_coords)
     
-    diff = cb_coords.unsqueeze(0) - cb_coords.unsqueeze(1)
-    distances = torch.norm(diff, dim=-1)
+    diff = cb_coords.unsqueeze(0) - cb_coords.unsqueeze(1)  # [L, L, 3] pairwise displacement vectors
+    distances = torch.norm(diff, dim=-1)  # [L, L] pairwise distance matrix
     return distances
 
 
@@ -330,7 +377,7 @@ def compute_backbone_no_distances(positions: torch.Tensor) -> torch.Tensor:
     
     # N[i] to O[j] distances
     diff = n_coords.unsqueeze(1) - o_coords.unsqueeze(0)  # [L, L, 3]
-    return torch.sqrt((diff ** 2).sum(-1) + 1e-8)
+    return torch.sqrt((diff ** 2).sum(-1) + 1e-8)  # [L, L]; 1e-8 avoids sqrt(0) NaN gradients at diagonal
 
 
 def compute_hbond_metrics(
@@ -367,6 +414,9 @@ def compute_hbond_metrics(
         pair_has_hbond = False
         pair_min_dist = min(dist_ni_oj, dist_nj_oi)
         
+        # Note: hbond_count can be incremented twice for the same (i, j) pair if both
+        # directions satisfy the threshold, whereas n_pairs_with_hbond below counts each
+        # pair at most once (has_hbond is a 0/1 indicator per pair, not per direction).
         if dist_ni_oj < threshold:
             hbond_count += 1
             hbond_distances.append(dist_ni_oj)
@@ -427,12 +477,14 @@ def define_hairpin_topology(
     strand2_start = turn_end
     strand2_end = strand2_start + strand2_length
     
-    # Build antiparallel cross-strand pairs
+    # Build antiparallel cross-strand pairs: strand1's first residue pairs with strand2's
+    # last residue, working inward (i-th residue of strand1 <-> (len-1-i)-th-from-end of
+    # strand2), matching how antiparallel beta strands actually hydrogen-bond.
     cross_strand_pairs = []
     for i in range(min(strand1_length, strand2_length)):
         res_i = strand1_start + i
         res_j = strand2_end - 1 - i
-        if res_j >= strand2_start:
+        if res_j >= strand2_start:  # defensive bound; always true given i < min(len1, len2) <= len2
             cross_strand_pairs.append((res_i, res_j))
     
     return HairpinTopology(
@@ -466,6 +518,11 @@ def get_block_sets_for_sweep(
     
     if sweep_mode == 'sliding_window':
         for window_size in (window_sizes or [5]):
+            # Slide a contiguous window of `window_size` blocks across every valid start
+            # position (0 .. total_blocks - window_size). The name format
+            # 'window_{size}_blocks_{start}_to_{end}' is later parsed back into
+            # window_size/window_start by run_hairpin_disruption_experiment via string
+            # splitting on '_', so keep this format in sync with that parsing.
             for start_block in range(total_blocks - window_size + 1):
                 end_block = start_block + window_size - 1
                 name = f'window_{window_size}_blocks_{start_block}_to_{end_block}'
@@ -479,6 +536,9 @@ def get_block_sets_for_sweep(
             blocks = {block}
         
         elif sweep_mode == 'cumulative_forward':
+            # NOTE: possible bug -- the display name hardcodes "47" instead of deriving it
+            # from `total_blocks - 1`; the actual `blocks` set below is correct for any
+            # total_blocks, but the name would be misleading if total_blocks != 48.
             name = f'blocks_{block}_to_47'
             blocks = set(range(block, total_blocks))
         
@@ -496,12 +556,15 @@ def get_block_sets_for_sweep(
 
 def get_baseline_structure(model, seq: str, tokenizer, device: str) -> EsmForProteinFoldingOutput:
     """Run baseline forward pass and return structure outputs."""
+    # Monkey-patch this model instance's forward methods (not the class), swapping in the
+    # custom functions above so we can run the modified trunk without subclassing or
+    # editing the HF transformers library source.
     model.forward = types.MethodType(baseline_forward, model)
     model.trunk.forward = types.MethodType(baseline_forward_trunk, model.trunk)
     
     with torch.no_grad():
         inputs = tokenizer(seq, return_tensors='pt', add_special_tokens=False).to(device)
-        outputs = model(**inputs, num_recycles=0)
+        outputs = model(**inputs, num_recycles=0)  # single trunk pass, no recycling (for speed across many sweep combos)
     
     L = len(seq)
     B = 1
@@ -514,16 +577,25 @@ def get_baseline_structure(model, seq: str, tokenizer, device: str) -> EsmForPro
         "s_z": outputs["s_z"],
     }
     
+    # The rest of this function manually redoes the subset of post-processing that the
+    # original EsmForProteinFolding.forward performs after the trunk call (atom14/atom37
+    # masks, residue_index, pLDDT), since our custom baseline_forward only returns the raw
+    # trunk dict. distogram/lm/ptm heads are deliberately skipped since
+    # compute_full_structure_metrics only needs coordinates + pLDDT.
     make_atom14_masks(structure)
     structure["residue_index"] = torch.arange(L, device=device).unsqueeze(0)
     
+    # states: [8, B, L, seq_dim] (one entry per structure-module IPA block); lddt_head
+    # reshapes its output logits to [8, B, L, -1, lddt_bins] for categorical_lddt below
     lddt_head = model.lddt_head(structure["states"]).reshape(
         structure["states"].shape[0], B, L, -1, model.lddt_bins
     )
     structure["lddt_head"] = lddt_head
-    plddt = categorical_lddt(lddt_head[-1], bins=model.lddt_bins)
+    plddt = categorical_lddt(lddt_head[-1], bins=model.lddt_bins)  # [-1]: use final (most refined) IPA block
     structure["plddt"] = plddt
     
+    # Per-block probing data collected by baseline_forward_trunk (only present here, not in
+    # run_intervention's output); reattached below as extra, non-standard output attributes.
     s_list = outputs.get("s_list")
     z_list = outputs.get("z_list")
     seq2pair_list = outputs.get("seq2pair_list")
@@ -556,6 +628,10 @@ def run_intervention(
     s_interventions: Optional[Dict[int, torch.Tensor]] = None,
 ) -> EsmForProteinFoldingOutput:
     """Run forward pass with s-only intervention."""
+    # Same monkey-patching + post-processing pattern as get_baseline_structure above, but
+    # using the intervention forward functions and passing through the block/direction args.
+    # s_list/z_list are not collected here since intervention_forward_trunk doesn't gather
+    # per-block probing data (only the final s_s/s_z are needed for structure metrics).
     model.forward = types.MethodType(intervention_forward, model)
     model.trunk.forward = types.MethodType(intervention_forward_trunk, model.trunk)
     
@@ -636,9 +712,15 @@ def create_hairpin_disruption_interventions(
     Returns:
         s_interventions dict, or None
     """
+    # Look up which representations to intervene on; falls back to treating
+    # intervention_config itself as a single-item list for unrecognized names (in practice
+    # only 's' is ever passed via CLI for this experiment).
     active_reps = INTERVENTION_CONFIGS.get(intervention_config, [intervention_config])
     
-    # Get charge signs for each strand
+    # Get charge signs for each strand. For both_positive/both_negative these are equal
+    # (same sign on both strands = electrostatic repulsion, the disruption manipulation);
+    # 'opposite' reproduces the original attractive induction setup as a control that
+    # should NOT disrupt the hairpin.
     strand1_sign, strand2_sign = CHARGE_MODES[charge_mode]
     
     s_interventions = None
@@ -650,12 +732,12 @@ def create_hairpin_disruption_interventions(
             if block not in directions.s_directions:
                 continue
             
-            s_dir = directions.s_directions[block]
-            s_std = directions.s_stds[block]
+            s_dir = directions.s_directions[block]  # [1024] unit-norm charge direction (pos - neg residue means)
+            s_std = directions.s_stds[block]  # scalar std of projections onto s_dir (for scaling `magnitude` to std-dev units)
             
-            s_int = torch.zeros(seq_len, len(s_dir), dtype=torch.float32, device=device)
+            s_int = torch.zeros(seq_len, len(s_dir), dtype=torch.float32, device=device)  # [L, 1024]; stays 0 outside both strands (no-op on turn/rest of sequence)
             
-            # Strand 1: apply strand1_sign charge
+            # Strand 1: apply strand1_sign charge (same delta broadcast to every residue in the strand)
             delta1 = strand1_sign * magnitude * s_std * s_dir
             for i in range(topology.strand1_start, topology.strand1_end):
                 s_int[i] = torch.tensor(delta1, device=device)
@@ -679,6 +761,9 @@ def compute_full_structure_metrics(
     topology: HairpinTopology,
 ) -> Dict[str, Any]:
     """Compute comprehensive structure metrics including H-bonds."""
+    # outputs.positions: [8, B, L, 14, 3] (8 structure-module IPA refinement steps).
+    # [-1, 0] selects the final refinement step and the single batch element -> [L, 14, 3],
+    # moved to CPU since the distance/H-bond helpers loop in plain Python.
     positions = outputs.positions[-1, 0].cpu()
     
     # CB distances
@@ -695,7 +780,7 @@ def compute_full_structure_metrics(
         'mean_cross_strand_dist': np.mean(cross_strand_cb_dists) if cross_strand_cb_dists else None,
         'min_cross_strand_dist': np.min(cross_strand_cb_dists) if cross_strand_cb_dists else None,
         'max_cross_strand_dist': np.max(cross_strand_cb_dists) if cross_strand_cb_dists else None,
-        'n_cb_contacts': sum(1 for d in cross_strand_cb_dists if d < 8.0),
+        'n_cb_contacts': sum(1 for d in cross_strand_cb_dists if d < 8.0),  # 8 Å: conventional Cβ-Cβ contact cutoff
         'n_pairs': len(cross_strand_cb_dists),
         # H-bond metrics
         'n_hbonds': hbond_metrics['n_hbonds'],
@@ -715,6 +800,7 @@ class ResultsManager:
     """Manages incremental saving of results."""
     
     def __init__(self, output_path: str, output_dir: str, save_every: int = 10):
+        """Initialize an empty results buffer and checkpointing configuration."""
         self.output_path = output_path
         self.output_dir = output_dir
         self.save_every = save_every
@@ -722,14 +808,17 @@ class ResultsManager:
         self.cases_processed = 0
     
     def add_results(self, new_results: List[Dict]):
+        """Append newly computed result rows to the in-memory buffer."""
         self.results.extend(new_results)
     
     def mark_case_done(self):
+        """Increment the processed-case counter, checkpointing (save + re-plot) every `save_every` cases."""
         self.cases_processed += 1
         if self.cases_processed % self.save_every == 0:
             self.save()
     
     def save(self):
+        """Flush buffered results to parquet and regenerate summary plots."""
         if len(self.results) == 0:
             return
         df = pd.DataFrame(self.results)
@@ -739,9 +828,12 @@ class ResultsManager:
         try:
             analyze_disruption_results(df, self.output_dir)
         except Exception as e:
+            # Plotting is best-effort here: a failure (e.g. too few rows for some stat) should
+            # not abort the long-running data-collection loop, so we just warn and continue.
             print(f"[Warning] Could not update plots: {e}")
     
     def get_dataframe(self) -> pd.DataFrame:
+        """Return all buffered results as a DataFrame."""
         return pd.DataFrame(self.results)
 
 
@@ -781,6 +873,8 @@ def run_hairpin_disruption_experiment(
         save_every=save_every
     )
     
+    # Restrict the block sweep to blocks that actually have a trained charge direction
+    # (training can skip a block if it had no positive- or negative-charge examples)
     available_blocks = set(directions.s_directions.keys())
     
     for case_idx, row in tqdm(cases_df.iterrows(), total=len(cases_df), desc="Cases"):
@@ -804,7 +898,7 @@ def run_hairpin_disruption_experiment(
         has_2_cols = 'donor_hairpin_start' in cases_df.columns
         
         if has_4_cols:
-            # donor_hairpins.csv: has all 4 strand boundaries
+            # donor_hairpins.csv: has all 4 strand boundaries, given as *inclusive* residue indices
             s1_start = int(row['strand1_start_res'])
             s1_end = int(row['strand1_end_res'])
             s2_start = int(row['strand2_start_res'])
@@ -816,7 +910,8 @@ def run_hairpin_disruption_experiment(
                       f"exceeds sequence length ({L})")
                 continue
             
-            # Convert inclusive boundaries to lengths
+            # Convert inclusive boundaries to lengths (define_hairpin_topology expects
+            # start + length, half-open intervals, not inclusive start/end pairs)
             topology = define_hairpin_topology(
                 hairpin_start=s1_start,
                 strand1_length=s1_end - s1_start + 1,  # inclusive -> length
@@ -825,9 +920,9 @@ def run_hairpin_disruption_experiment(
             )
         
         elif has_2_cols:
-            # patching_successes.csv: has strand/loop lengths
+            # patching_successes.csv: already stores strand/loop lengths directly (no conversion needed)
             hairpin_start = int(row['donor_hairpin_start'])
-            hairpin_end = int(row['donor_hairpin_end'])
+            hairpin_end = int(row['donor_hairpin_end'])  # read but unused below (end is re-derived from start + lengths)
             s1_len = int(row['donor_strand1_length'])
             loop_len = int(row['donor_loop_length'])
             s2_len = int(row['donor_strand2_length'])
@@ -849,7 +944,7 @@ def run_hairpin_disruption_experiment(
             print(f"  Skipping case {case_idx}: no hairpin boundary columns found")
             continue
         
-        # Name/PDB
+        # Name/PDB: resolve a human-readable case identifier across the differing CSV schemas
         if 'PDB' in cases_df.columns:
             name = row['PDB']
         elif 'donor_pdb' in cases_df.columns:
@@ -890,7 +985,9 @@ def run_hairpin_disruption_experiment(
         #           f"({baseline_metrics['mean_cross_strand_dist']:.1f}Å) > 8.5Å threshold")
         #     continue
         
-        # Record baseline
+        # Record baseline. Sentinel values ('baseline' / 0 / -1) mark this as the no-intervention
+        # control row; analyze_disruption_results later filters on intervention_config == 'baseline'
+        # to separate this from the actual intervention rows appended below.
         case_results.append({
             'case_idx': case_idx,
             'name': name,
@@ -920,12 +1017,16 @@ def run_hairpin_disruption_experiment(
         
         # Interventions
         for block_set_name, intervention_blocks in block_sets:
+            # Drop any blocks lacking a trained direction (see `available_blocks` above)
             intervention_blocks = intervention_blocks & available_blocks
             
             if len(intervention_blocks) == 0:
                 continue
             
-            # Parse window info from block_set_name
+            # Parse window info from block_set_name, e.g. 'window_5_blocks_3_to_7' ->
+            # parts = ['window','5','blocks','3','to','7'] -> window_size=5, window_start=3.
+            # Only meaningful for sliding_window sweeps (see get_block_sets_for_sweep); other
+            # sweep modes leave window_size=0, window_start=-1.
             window_size = 0
             window_start = -1
             if 'window_' in block_set_name:
@@ -933,6 +1034,8 @@ def run_hairpin_disruption_experiment(
                 window_size = int(parts[1])
                 window_start = int(parts[3])
             
+            # Full grid sweep: every combination of charge polarity, intervention config,
+            # and magnitude is tested for this block_set.
             for charge_mode in charge_modes:
                 for int_config in intervention_configs:
                     for magnitude in magnitudes:
@@ -959,7 +1062,9 @@ def run_hairpin_disruption_experiment(
                         
                         int_metrics = compute_full_structure_metrics(int_outputs, topology)
                         
-                        # Compute changes
+                        # Compute changes relative to baseline. The truthy checks below double as
+                        # None-guards (real cross-strand distances are never exactly 0, so treating
+                        # 0.0 as "missing" is harmless in practice).
                         dist_change = None
                         hbond_change = None
                         if baseline_metrics['mean_cross_strand_dist'] and int_metrics['mean_cross_strand_dist']:
@@ -1002,13 +1107,16 @@ def run_hairpin_disruption_experiment(
                                   f"blocks={block_set_name}, mag={magnitude}, "
                                   f"hbond_change={hbond_change} ***")
                         
-                        # Log if distance increased (expected for disruption)
+                        # Log if distance increased (expected for disruption); +2.0 Å is an
+                        # arbitrary "notable change" threshold for console visibility only --
+                        # it does not affect what gets saved to case_results/the parquet file.
                         if dist_change is not None and dist_change > 2.0:
                             print(f"  + Distance increased: {baseline_metrics['mean_cross_strand_dist']:.1f} -> "
                                   f"{int_metrics['mean_cross_strand_dist']:.1f} (+{dist_change:.1f}Å) | "
                                   f"{charge_mode}, {block_set_name}, mag={magnitude}")
                         
-                        # Log if H-bonds decreased (expected for disruption)
+                        # Log if H-bonds decreased (expected for disruption). Same condition as
+                        # the "H-BONDS DISRUPTED" check above, so both messages print together.
                         if hbond_change is not None and hbond_change < 0:
                             print(f"  - H-bonds decreased: {baseline_metrics['n_hbonds']} -> "
                                   f"{int_metrics['n_hbonds']} ({hbond_change}) | "
@@ -1017,6 +1125,8 @@ def run_hairpin_disruption_experiment(
                                   f"{int_metrics['mean_cross_strand_dist']:.1f} (+{dist_change:.1f}Å) | "
                                   f"{charge_mode}, {block_set_name}, mag={magnitude}")
                         
+                        # Free GPU memory between runs -- this inner loop can execute many
+                        # thousands of times per case (blocks x charge_modes x configs x magnitudes)
                         del s_ints, int_outputs
                         torch.cuda.empty_cache()
         
@@ -1050,7 +1160,8 @@ def analyze_disruption_results(results_df: pd.DataFrame, output_dir: str):
 
     print(f"\nInterventions: {len(interventions)} total")
 
-    # Check for sliding window data
+    # Check for sliding window data. This toggles between a richer 2x2 plot layout (with
+    # window-position breakdowns) below and a simpler magnitude-only 1x2 layout.
     has_window = 'window_size' in interventions.columns and interventions['window_size'].max() > 0
 
     # Distance change by charge mode
@@ -1088,6 +1199,8 @@ def analyze_disruption_results(results_df: pd.DataFrame, output_dir: str):
         'opposite': 'green',
     }
     
+    # Computed but not used by any plot below (this experiment only ever sweeps
+    # intervention_config='s', so there's nothing to distinguish with per-config markers)
     configs = sorted(interventions['intervention_config'].unique())
     config_markers = dict(zip(configs, ['o', 's', '^', 'D', 'v', '<', '>', 'p']))
     
@@ -1115,6 +1228,9 @@ def analyze_disruption_results(results_df: pd.DataFrame, output_dir: str):
                             valid_starts.append(wstart)
 
                 if len(means) > 0:
+                    # Distinguish up to 3 window sizes by line style: solid for the smallest,
+                    # dashed for the largest, dotted for anything in between (so >3 window
+                    # sizes will visually collapse onto the same dotted style).
                     linestyle = '-' if ws == window_sizes[0] else '--' if ws == window_sizes[-1] else ':'
                     ax.plot(valid_starts, means, linestyle, label=f'{charge_mode}, w={ws}',
                            color=charge_colors.get(charge_mode, 'gray'), linewidth=2,
@@ -1127,7 +1243,7 @@ def analyze_disruption_results(results_df: pd.DataFrame, output_dir: str):
         ax.legend(loc='best', fontsize=7)
         ax.grid(alpha=0.3)
 
-        # Top-right: H-bond change by window position
+        # Top-right: H-bond change by window position (same grouping/linestyle scheme as top-left)
         ax = axes[0, 1]
         for charge_mode in charge_modes_list:
             cm_data = interventions[interventions['charge_mode'] == charge_mode]
@@ -1166,7 +1282,7 @@ def analyze_disruption_results(results_df: pd.DataFrame, output_dir: str):
                 continue
 
             means = []
-            stds = []
+            stds = []  # despite the name, this holds SEM (std / sqrt(n)), not raw std dev
             mags = sorted(subset['magnitude'].unique())
             for mag in mags:
                 mag_subset = subset[subset['magnitude'] == mag]
@@ -1184,7 +1300,7 @@ def analyze_disruption_results(results_df: pd.DataFrame, output_dir: str):
         ax.legend(loc='best', fontsize=8)
         ax.grid(alpha=0.3)
 
-        # Bottom-right: H-bond change by magnitude
+        # Bottom-right: H-bond change by magnitude (SEM error bars again, same as bottom-left)
         ax = axes[1, 1]
         for charge_mode in charge_modes_list:
             subset = interventions[interventions['charge_mode'] == charge_mode]
@@ -1211,7 +1327,8 @@ def analyze_disruption_results(results_df: pd.DataFrame, output_dir: str):
         ax.grid(alpha=0.3)
 
     else:
-        # Non-window version
+        # Non-window version: same magnitude-sweep + SEM-errorbar logic as the bottom row of
+        # the has_window branch above, just laid out as a standalone 1x2 figure.
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
         # Left: Distance change by magnitude
@@ -1270,7 +1387,8 @@ def analyze_disruption_results(results_df: pd.DataFrame, output_dir: str):
     plt.savefig(os.path.join(output_dir, 'disruption_summary.png'), dpi=150)
     plt.close()
     
-    # Additional comparison plot: both_positive vs both_negative
+    # Additional comparison plot: both_positive vs both_negative (only produced when both of
+    # the two "true disruption" charge modes are present; 'opposite' control is excluded here)
     if 'both_positive' in charge_modes_list and 'both_negative' in charge_modes_list:
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
         
@@ -1310,6 +1428,7 @@ def analyze_disruption_results(results_df: pd.DataFrame, output_dir: str):
 # ============================================================================
 
 def parse_args():
+    """Parse command-line arguments for the hairpin disruption experiment."""
     parser = argparse.ArgumentParser(
         description='Hairpin DISRUPTION experiment with same-charge interventions'
     )
@@ -1322,7 +1441,7 @@ def parse_args():
     parser.add_argument('--probing_dataset', type=str, default=None,
                         help='Path to probing dataset CSV (required if --directions not provided)')
     parser.add_argument('--n_cases', type=int, default=400,
-                        help='Limit number of cases')
+                        help='Limit number of cases')  # bounds runtime given the large per-case sweep grid (blocks x charge_modes x configs x magnitudes)
     parser.add_argument('--magnitudes', type=float, nargs='+',
                         default=[0.5, 1.0],
                         help='Intervention magnitudes (in std devs)')
@@ -1331,7 +1450,7 @@ def parse_args():
                         help='Intervention configs (s-only for this experiment)')
     parser.add_argument('--charge_modes', type=str, nargs='+',
                         default=['both_positive', 'both_negative'],
-                        help='Charge modes: both_positive, both_negative, opposite')
+                        help='Charge modes: both_positive, both_negative, opposite')  # default omits the 'opposite' control; pass it explicitly to include it
     parser.add_argument('--save_every', type=int, default=3,
                         help='Save checkpoint every N cases')
     parser.add_argument('--device', type=str, default=None,
@@ -1349,6 +1468,7 @@ def parse_args():
 
 
 def main():
+    """Entry point: load the model, load or train charge directions, run the disruption sweep, and analyze results."""
     args = parse_args()
     
     os.makedirs(args.output, exist_ok=True)
@@ -1359,9 +1479,7 @@ def main():
     print(f"Using device: {device}")
     
     # Load model
-    print("\nLoading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    model, tokenizer = load_esmfold(device)
     
     # =========================================================================
     # Load hairpin cases for disruption experiments
@@ -1382,7 +1500,7 @@ def main():
     # =========================================================================
     # Load or Train DoM directions (s-only)
     # =========================================================================
-    blocks_to_use = list(range(0, NUM_BLOCKS))
+    blocks_to_use = list(range(0, NUM_BLOCKS))  # train/use directions for every trunk block (0-47)
 
     if args.directions and os.path.exists(args.directions):
         print(f"\nLoading directions from {args.directions}...")
@@ -1392,6 +1510,9 @@ def main():
         if args.probing_dataset is None:
             raise ValueError("Must provide either --directions (to a valid file) or --probing_dataset (to train new directions)")
 
+        # Reaching here means args.directions was either None or a path that doesn't exist yet;
+        # if it was a (not-yet-existing) path, train and save there, otherwise use the default
+        # location under the output directory.
         directions_save_path = args.directions or os.path.join(args.output, 'charge_directions.pt')
 
         print("\n" + "="*60)
@@ -1405,6 +1526,11 @@ def main():
             print(f"\nDataset composition:")
             print(probing_df.groupby(['split', 'structure_type']).size().unstack(fill_value=0))
 
+        # Train charge directions only on alpha-helical sequences (not hairpins), so the
+        # learned direction reflects a general amino-acid-charge feature rather than being
+        # confounded with hairpin geometry itself -- keeping training independent of the
+        # structures used in the causal disruption test below (matches the convention in
+        # charge_dom_training.py).
         train_df = probing_df[
             (probing_df['split'] == 'train') &
             (probing_df['structure_type'] == 'alpha_helical')
@@ -1436,6 +1562,8 @@ def main():
     # =========================================================================
     block_sets = get_block_sets_for_sweep(
         sweep_mode=args.block_sweep,
+        # Default to every 4th block (0, 4, ..., 44) if not specified; only used by the
+        # 'single'/'cumulative_*' sweep modes (sliding_window uses window_sizes instead)
         sweep_blocks=args.sweep_blocks or list(range(0, NUM_BLOCKS, 4)),
         total_blocks=NUM_BLOCKS,
         window_sizes=args.window_sizes,

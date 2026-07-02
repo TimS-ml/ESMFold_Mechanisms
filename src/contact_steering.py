@@ -62,6 +62,10 @@ from transformers.models.esm.openfold_utils import make_atom14_masks
 from transformers.utils import ContextManagers
 
 from src.utils.representation_utils import CollectedRepresentations, TrunkHooks
+from src.utils.model_utils import load_esmfold
+# Reuse the DistanceProbe class, hook-based z collection, CA-distance calc, and
+# probe train/eval helpers from the standalone distance-probing script so both
+# scripts share one canonical probe implementation.
 from main_paper.z_probing_distance import (
     DistanceProbe, run_and_collect_z, compute_ca_distances,
     AA_TO_IDX, evaluate_probes_online, plot_probe_results,
@@ -72,9 +76,9 @@ from main_paper.z_probing_distance import (
 # CONSTANTS
 # ============================================================================
 
-NUM_BLOCKS = 48
-CONTACT_THRESHOLD = 8.0
-CLOSE_CONTACT_THRESHOLD = 6.0
+NUM_BLOCKS = 48                # Number of blocks in the ESMFold folding trunk
+CONTACT_THRESHOLD = 8.0        # Cβ-Cβ distance (Å) below which residues count as "in contact"
+CLOSE_CONTACT_THRESHOLD = 6.0  # Stricter Cβ-Cβ distance (Å) for a "close" contact
 TARGET_DISTANCE = 5.5  # Target Cβ-Cβ distance for β-sheet H-bonding
 HBOND_DISTANCE = 3.5   # N-O distance threshold for H-bond
 
@@ -86,9 +90,9 @@ HBOND_DISTANCE = 3.5   # N-O distance threshold for H-bond
 @dataclass
 class GradientDirections:
     """Cached gradient directions for all blocks."""
-    directions: Dict[int, np.ndarray]
-    stds: Dict[int, float]
-    probes: Dict[int, DistanceProbe]
+    directions: Dict[int, np.ndarray]  # block_idx -> unit-norm direction that decreases predicted distance
+    stds: Dict[int, float]             # block_idx -> std of z projected onto the direction (for magnitude scaling)
+    probes: Dict[int, DistanceProbe]   # block_idx -> trained Ridge probe (weights/bias) for that block
 
 
 @dataclass
@@ -100,6 +104,7 @@ class HairpinTopology:
     turn_end: int
     strand2_start: int
     strand2_end: int
+    # (i, j) residue index pairs across the two strands expected to H-bond in an ideal antiparallel hairpin
     cross_strand_pairs: List[Tuple[int, int]]
 
 
@@ -116,6 +121,9 @@ def get_baseline_structure(
     """
     Run baseline forward pass and return full outputs with z_list.
     """
+    # run_and_collect_z registers forward hooks on the trunk blocks (collect_z=True)
+    # around a normal model call, so `collector.z_blocks` ends up with one [1, L, L, 128]
+    # pairwise tensor per block in addition to the standard model outputs.
     outputs, collector = run_and_collect_z(model, tokenizer, device, sequence)
     
     L = len(sequence)
@@ -129,6 +137,9 @@ def get_baseline_structure(
         "s_z": outputs.s_z,
     }
     
+    # Re-derive atom14/atom37 masks and pLDDT from raw tensors (same computation the
+    # model's own forward already performs) so we can repackage a standalone
+    # EsmForProteinFoldingOutput with the extra z_list field attached below.
     make_atom14_masks(structure)
     structure["residue_index"] = torch.arange(L, device=device).unsqueeze(0)
     
@@ -154,6 +165,8 @@ def get_baseline_structure(
         plddt=structure["plddt"],
     )
     
+    # Attach per-block pairwise reps (dict[int, [1, L, L, 128]]) for later use as
+    # the "current z" baseline when computing targeted steering vectors.
     full_output.z_list = collector.z_blocks
     
     return full_output, collector
@@ -170,7 +183,14 @@ def make_z_intervention_forward(
     """
     Create trunk forward that applies z interventions at specified blocks.
     """
+    # This is a near-verbatim copy of EsmFoldingTrunk.forward (transformers'
+    # modeling_esmfold.py) with a single addition: after each block, if its index
+    # is both requested (intervention_blocks) and has a prepared delta
+    # (z_interventions), that delta is added to the pairwise repr z. Copying the
+    # whole method (rather than patching just the block loop) is necessary because
+    # the recycling/structure-module logic all lives in this one function body.
     def forward(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
+        """Drop-in replacement for EsmFoldingTrunk.forward that injects z interventions after chosen blocks."""
         device = seq_feats.device
         s_s_0, s_z_0 = seq_feats, pair_feats
 
@@ -180,12 +200,15 @@ def make_z_intervention_forward(
             no_recycles += 1
 
         def trunk_iter(s, z, residx, mask):
+            """Run one pass through all trunk blocks, adding z interventions after the targeted blocks."""
             z = z + self.pairwise_positional_embedding(residx, mask=mask)
             
             for block_idx, block in enumerate(self.blocks):
                 s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
                 
                 # Apply intervention after block
+                # z: [B, L, L, 128]; z_interventions[block_idx]: [L, L, 128] built without a
+                # batch dim, so unsqueeze(0) broadcasts it onto the (batch=1) pairwise repr.
                 if block_idx in intervention_blocks and block_idx in z_interventions:
                     z = z + z_interventions[block_idx].unsqueeze(0)
             
@@ -196,6 +219,11 @@ def make_z_intervention_forward(
         recycle_z = torch.zeros_like(s_z)
         recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
 
+        # Recycling: run the trunk+structure module up to `no_recycles` times, each time
+        # feeding back the previous iteration's s/z (normalized) and a distogram computed
+        # from the predicted Cβ coordinates. Every recycle re-applies the interventions
+        # inside trunk_iter, so the steering is injected fresh on every recycling pass.
+        # Only the final pass is done with gradients enabled (ContextManagers([]) vs no_grad()).
         for recycle_idx in range(no_recycles):
             with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
                 recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
@@ -210,6 +238,8 @@ def make_z_intervention_forward(
                 )
 
                 recycle_s, recycle_z = s_s, s_z
+                # Bin the predicted Cβ-Cβ distances (inferred from N/CA/C backbone atoms) into
+                # discrete distogram bins to condition the next recycling iteration.
                 recycle_bins = EsmFoldingTrunk.distogram(
                     structure["positions"][-1][:, :, :3],
                     3.375, 21.375, self.recycle_bins,
@@ -232,6 +262,10 @@ def z_intervention_context(
     """
     Context manager for applying z interventions during forward pass.
     """
+    # Monkey-patch model.trunk.forward for the duration of the `with` block only:
+    # save the bound original method, swap in the intervention version (bound via
+    # types.MethodType so `self` resolves correctly), then always restore the
+    # original in `finally` so the patch never leaks into subsequent calls/errors.
     original = model.trunk.forward
     
     intervention_forward = make_z_intervention_forward(intervention_blocks, z_interventions)
@@ -254,6 +288,8 @@ def run_with_intervention(
     """
     Run forward pass with z interventions using context manager.
     """
+    # num_recycles=0 -> exactly one trunk pass (no additional recycling iterations),
+    # keeping the intervention's effect on structure prediction easy to interpret.
     with z_intervention_context(model, intervention_blocks, z_interventions):
         with torch.no_grad():
             inputs = tokenizer(sequence, return_tensors='pt', add_special_tokens=False).to(device)
@@ -270,6 +306,8 @@ def run_with_intervention(
         "s_z": outputs.s_z,
     }
     
+    # Same pattern as get_baseline_structure: recompute atom14/atom37 masks and pLDDT
+    # from raw tensors to build a fresh, standalone output object.
     make_atom14_masks(structure)
     structure["residue_index"] = torch.arange(L, device=device).unsqueeze(0)
     
@@ -316,9 +354,9 @@ def compute_cb_distances(positions: torch.Tensor) -> torch.Tensor:
             cb = positions[i, CA_IDX]
         cb_coords.append(cb)
     
-    cb_coords = torch.stack(cb_coords)
-    diff = cb_coords.unsqueeze(0) - cb_coords.unsqueeze(1)
-    return torch.sqrt((diff ** 2).sum(-1) + 1e-8)
+    cb_coords = torch.stack(cb_coords)  # [L, 3]
+    diff = cb_coords.unsqueeze(0) - cb_coords.unsqueeze(1)  # [L, L, 3] pairwise coordinate diffs
+    return torch.sqrt((diff ** 2).sum(-1) + 1e-8)  # 1e-8 avoids NaN gradients from sqrt(0) at i==j
 
 
 def compute_backbone_no_distances(positions: torch.Tensor) -> torch.Tensor:
@@ -335,7 +373,7 @@ def compute_backbone_no_distances(positions: torch.Tensor) -> torch.Tensor:
     
     # N[i] to O[j] distances
     diff = n_coords.unsqueeze(1) - o_coords.unsqueeze(0)  # [L, L, 3]
-    return torch.sqrt((diff ** 2).sum(-1) + 1e-8)
+    return torch.sqrt((diff ** 2).sum(-1) + 1e-8)  # [L, L]; +1e-8 avoids sqrt(0) NaN gradients
 
 
 def define_hairpin_topology(
@@ -344,9 +382,13 @@ def define_hairpin_topology(
     turn_length: int = 4,
 ) -> HairpinTopology:
     """Define a hypothetical hairpin topology for a region."""
+    # Step 1: split the region evenly into strand1 + turn + strand2, biasing any
+    # leftover residues (from integer division) into strand2.
     region_length = region_end - region_start
     strand_length = (region_length - turn_length) // 2
     
+    # Step 2: guard against too-short strands (e.g. small regions) by enforcing a
+    # minimum of 3 residues per strand, shrinking the turn to compensate.
     if strand_length < 3:
         strand_length = 3
         turn_length = max(2, region_length - 2 * strand_length)
@@ -358,6 +400,10 @@ def define_hairpin_topology(
     strand2_start = turn_end
     strand2_end = min(strand2_start + strand_length, region_end)
     
+    # Step 3: pair residues antiparallel-style, i.e. strand1 residue i (counting from
+    # its N-terminal start) pairs with strand2 residue i counting from strand2's
+    # C-terminal end. This mirrors real β-hairpins, where the turn reverses strand
+    # direction so the two strands run antiparallel to each other.
     cross_strand_pairs = []
     actual_strand2_len = strand2_end - strand2_start
     actual_strand1_len = strand1_end - strand1_start
@@ -397,6 +443,8 @@ def get_sliding_window_block_sets(
     
     for start_block in range(total_blocks - window_size + 1):
         end_block = start_block + window_size - 1
+        # Name encodes window_size/start/end positionally so it can be parsed back
+        # out later (see run_gradient_steering_experiment's block_set_name.split('_')).
         name = f'w{window_size}_blocks_{start_block}_to_{end_block}'
         blocks = set(range(start_block, start_block + window_size))
         block_sets.append((name, blocks))
@@ -416,6 +464,10 @@ class OnlineRidgeAccumulator:
     Only stores X'X [dim, dim] and X'y [dim], not the raw data.
     This is mathematically equivalent to batch Ridge regression.
     """
+    # Why: with hundreds of proteins x hundreds of sampled pairs each, holding every
+    # [L, L, dim] z sample in memory to fit a single batch Ridge regression would be
+    # prohibitive. X'X and X'y accumulate additively across batches/proteins, so this
+    # gives the exact closed-form Ridge solution (see solve()) using only O(dim^2) memory.
     dim: int
     block_idx: int
     
@@ -427,6 +479,7 @@ class OnlineRidgeAccumulator:
     n_samples: int = 0
     
     def __post_init__(self):
+        """Allocate zero-initialized accumulator arrays now that `dim` is known (runs right after dataclass __init__)."""
         self.XtX = np.zeros((self.dim, self.dim), dtype=np.float64)
         self.Xty = np.zeros(self.dim, dtype=np.float64)
     
@@ -438,6 +491,8 @@ class OnlineRidgeAccumulator:
             X: Feature matrix [batch_size, dim]
             y: Target values [batch_size]
         """
+        # Cast to float64: accumulating in float32 across many proteins/batches would
+        # lose precision in the running sums (XtX, Xty, yty).
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64)
         
@@ -461,8 +516,8 @@ class OnlineRidgeAccumulator:
             raise ValueError(f"No samples for block {self.block_idx}")
         
         # Solve (X'X + αI) w = X'y
-        regularized = self.XtX + alpha * np.eye(self.dim)
-        weights = np.linalg.solve(regularized, self.Xty)
+        regularized = self.XtX + alpha * np.eye(self.dim)  # add L2 penalty (Ridge) to the diagonal
+        weights = np.linalg.solve(regularized, self.Xty)  # solves the linear system directly (avoids explicit matrix inverse)
         
         # Bias: for Ridge without centering, bias = 0
         bias = 0.0
@@ -532,20 +587,23 @@ def train_distance_probes_chunked(
             gc.collect()
             continue
         
-        # Initialize accumulators on first protein
+        # Initialize accumulators on first protein (need z's feature dim, e.g. 128,
+        # which isn't known until we've run the model once).
         if dim is None:
-            first_z = next(iter(collector.z_blocks.values()))
+            first_z = next(iter(collector.z_blocks.values()))  # [1, L, L, dim]
             dim = first_z.shape[-1]
             print(f"Z dimension: {dim}")
             accumulators = {b: OnlineRidgeAccumulator(dim=dim, block_idx=b) for b in range(NUM_BLOCKS)}
         
         # Compute CA distances
-        final_positions = outputs.positions[-1, 0]
+        final_positions = outputs.positions[-1, 0]  # [L, 14, 3]: last IPA refinement iter, batch 0
         distances = compute_ca_distances(final_positions)
         
         # Sample pairs (all pairs where i != j)
         all_pairs = [(i, j) for i in range(L) for j in range(L) if i != j]
         
+        # Subsample pairs per protein (rather than using all L^2 pairs) to bound the
+        # per-protein cost and give every protein roughly equal weight in training.
         if len(all_pairs) > n_pairs_per_protein:
             sampled_indices = np.random.choice(len(all_pairs), n_pairs_per_protein, replace=False)
             sampled_pairs = [all_pairs[k] for k in sampled_indices]
@@ -581,6 +639,8 @@ def train_distance_probes_chunked(
     stds = {}
     
     for block in tqdm(range(NUM_BLOCKS), desc="Solving probes"):
+        # Skip blocks with too few samples (< 100) to fit a trustworthy probe;
+        # such blocks are simply absent from the returned directions/probes/stds.
         if accumulators[block].n_samples < 100:
             continue
         
@@ -589,6 +649,10 @@ def train_distance_probes_chunked(
         directions[block] = probe.get_gradient_direction()
         
         # Compute std from overall variance of z projected onto weight direction
+        # diag(X'X)/n approximates E[x_k^2] per feature k (uncentered 2nd moment, since
+        # bias=0 means no mean-subtraction); averaging across dims and sqrt gives a
+        # rough per-block scale of z's magnitude, used to make steering `magnitude`
+        # (in std units) comparable across blocks with different activation scales.
         n = accumulators[block].n_samples
         overall_var = accumulators[block].XtX.diagonal() / n
         stds[block] = float(np.sqrt(np.mean(np.maximum(overall_var, 0)) + 1e-8))
@@ -605,6 +669,8 @@ def train_distance_probes_chunked(
 
 def save_directions(directions: GradientDirections, path: str):
     """Save directions to disk."""
+    # Flatten each DistanceProbe dataclass into a plain dict of its fields so the
+    # checkpoint is just plain Python/numpy objects (no custom class needed to unpickle).
     probes_data = {
         block: {'weights': p.weights, 'bias': p.bias, 'block_idx': p.block_idx, 'r2_train': p.r2_train}
         for block, p in directions.probes.items()
@@ -619,7 +685,10 @@ def save_directions(directions: GradientDirections, path: str):
 
 def load_directions(path: str) -> GradientDirections:
     """Load directions from disk."""
+    # weights_only=False: needed because the checkpoint holds plain dicts/floats, not
+    # just tensors, which torch's newer weights_only=True safe-loader would reject.
     data = torch.load(path, weights_only=False)
+    # Reconstruct DistanceProbe objects from the plain per-field dicts saved above.
     probes = {
         block: DistanceProbe(**pdata)
         for block, pdata in data['probes'].items()
@@ -675,6 +744,8 @@ def create_targeted_steering_intervention(
         std = directions.stds.get(block, 1.0)
         baseline_z = baseline_z_list[block][0].cpu().numpy()  # [L, L, dim]
         
+        # Per-block delta tensor, zero everywhere except at cross-strand pairs;
+        # this gets added onto z at `block` inside the intervention forward.
         z_int = torch.zeros(seq_len, seq_len, len(probe.weights), 
                            dtype=torch.float32, device=device)
         
@@ -682,7 +753,8 @@ def create_targeted_steering_intervention(
             # Get current z for this pair
             current_z = baseline_z[i, j]
             
-            # Compute steering vector to reach target distance
+            # Exact delta (in z-space) the linear probe says would move its predicted
+            # distance for this pair from the current baseline value to target_distance.
             steering = probe.get_steering_vector(current_z, target_distance)
             
             # Normalize steering direction
@@ -692,10 +764,15 @@ def create_targeted_steering_intervention(
             else:
                 steering_direction = steering
             
-            # Scale by magnitude * std (so magnitude is in std units)
+            # Discard the exact delta's magnitude (which depends on how far the
+            # baseline already is from target) and instead rescale to a fixed,
+            # std-normalized magnitude. This decouples intervention strength from
+            # each pair's baseline distance, so `magnitude` is directly comparable
+            # across residue pairs, blocks, and proteins.
             scaled_steering = magnitude * std * steering_direction
             
-            # Apply symmetrically
+            # Apply symmetrically: z[i,j] and z[j,i] both represent the same residue
+            # pair, so both entries get nudged identically to keep the intervention consistent.
             z_int[i, j] = torch.tensor(scaled_steering, dtype=torch.float32, device=device)
             z_int[j, i] = torch.tensor(scaled_steering, dtype=torch.float32, device=device)
         
@@ -716,6 +793,10 @@ def create_gradient_intervention(
     Create z interventions using gradient directions (original method).
     Moves in the direction that decreases predicted distance.
     """
+    # Note: unlike create_targeted_steering_intervention, this applies the same fixed
+    # direction/magnitude to every cross-strand pair regardless of each pair's current
+    # baseline z (simpler, but not aimed at a specific target_distance). Not currently
+    # called from main(); create_targeted_steering_intervention is used instead.
     z_interventions = {}
     
     for block in blocks:
@@ -777,13 +858,17 @@ def compute_comprehensive_metrics(
     # Contact counts
     n_contacts_8A = sum(1 for d in cb_dists if d < CONTACT_THRESHOLD)
     n_contacts_6A = sum(1 for d in cb_dists if d < CLOSE_CONTACT_THRESHOLD)
-    n_contacts_target = sum(1 for d in cb_dists if abs(d - target_distance) < 1.0)
+    n_contacts_target = sum(1 for d in cb_dists if abs(d - target_distance) < 1.0)  # within +/-1A of target counts as "at target"
     
     # Potential H-bonds
     n_potential_hbonds = sum(1 for d in no_dists if d < HBOND_DISTANCE)
     
     # Distance to target
     mean_cb_dist = np.mean(cb_dists) if cb_dists else None
+    # NOTE: possible bug -- `if mean_cb_dist` is a truthiness check, so a (practically
+    # impossible but not-disallowed) mean distance of exactly 0.0 would be treated the
+    # same as None/empty and silently produce dist_to_target=None instead of the true
+    # value. Should be `if mean_cb_dist is not None`.
     dist_to_target = abs(mean_cb_dist - target_distance) if mean_cb_dist else None
     
     # pLDDT in region
@@ -830,6 +915,8 @@ def compute_cross_strand_distances(
     topology: HairpinTopology,
 ) -> Dict[str, float]:
     """Compute distances for cross-strand pairs (simplified version)."""
+    # Thin alias kept for naming parity with the same-named function in
+    # charge_steering.py; not otherwise used within this file.
     return compute_comprehensive_metrics(outputs, topology)
 
 
@@ -839,6 +926,8 @@ def compute_cross_strand_distances(
 
 def save_structure_as_pdb(outputs: EsmForProteinFoldingOutput, model, path: str):
     """Save structure as PDB file."""
+    # .detach() is required because model.output_to_pdb() calls .numpy() on every
+    # field internally, which fails on tensors still tracking gradients.
     clean = {
         "positions": outputs.positions.detach(),
         "aatype": outputs.aatype.detach(),
@@ -974,7 +1063,9 @@ def run_gradient_steering_experiment(
         del baseline_outputs
         torch.cuda.empty_cache()
         
-        # Precompute valid block sets
+        # Precompute valid block sets: restrict each sliding window to only the
+        # blocks that actually have a trained probe/direction (some blocks may have
+        # been skipped during training due to too few samples).
         valid_block_sets = []
         for block_set_name, intervention_blocks in block_sets:
             ib = intervention_blocks & available_blocks
@@ -986,7 +1077,8 @@ def run_gradient_steering_experiment(
         pbar = tqdm(total=n_total, desc=f"Case {case_idx}", leave=False)
         
         for block_set_name, intervention_blocks in valid_block_sets:
-            # Extract window_size and window start/end from name
+            # Extract window_size and window start/end from name, e.g.
+            # 'w5_blocks_10_to_14'.split('_') -> ['w5','blocks','10','to','14']
             parts = block_set_name.split('_')
             window_size = int(parts[0][1:])  # Remove 'w' prefix
             window_start = int(parts[2])
@@ -1020,6 +1112,11 @@ def run_gradient_steering_experiment(
                 int_metrics = compute_comprehensive_metrics(int_outputs, topology, target_distance)
 
                 # Compute changes from baseline
+                # NOTE: possible bug -- these truthiness checks (`if x and y`) would
+                # skip the computation if either value happened to be exactly 0.0,
+                # treating a legitimate zero the same as None/missing. Contrast with
+                # contacts_6A_change/hbond_change below, which correctly use
+                # `is not None` for their (integer, more plausibly zero) values.
                 cb_dist_change = None
                 if baseline_metrics['mean_cb_dist'] and int_metrics['mean_cb_dist']:
                     cb_dist_change = int_metrics['mean_cb_dist'] - baseline_metrics['mean_cb_dist']
@@ -1102,7 +1199,8 @@ def run_gradient_steering_experiment(
         
         results.extend(case_results)
         
-        # Periodic save
+        # Periodic save: write a checkpoint parquet every `save_every` cases so
+        # partial results survive a crash/timeout during a long sweep.
         if (case_idx + 1) % save_every == 0:
             pd.DataFrame(results).to_parquet(results_path, index=False)
             tqdm.write(f"[Checkpoint] Saved {len(results)} results after {case_idx + 1} cases")
@@ -1135,7 +1233,8 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
 
     print(f"\nInterventions: {len(interventions)} total")
     
-    # Get unique window sizes and magnitudes
+    # Get unique window sizes and magnitudes (window_size>0 defensively excludes any
+    # leftover baseline-style rows, since baseline rows use window_size=0)
     window_sizes = sorted([ws for ws in interventions['window_size'].unique() if ws > 0])
     magnitudes = sorted(interventions['magnitude'].unique())
     
@@ -1156,7 +1255,8 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
               f"ΔCβ={mean_cb_change:+.1f}Å, ΔpLDDT={mean_plddt_change:+.1f}, "
               f"Δcontacts={mean_contacts_change:+.1f}, Δhbonds={mean_hbond_change:+.1f}")
     
-    # Plotting - 3x2 grid
+    # Plotting - 3x2 grid: distance/contact/H-bond/pLDDT change vs magnitude (top two
+    # rows + pLDDT), plus distance-to-target and H-bond change vs window position (bottom row)
     fig, axes = plt.subplots(3, 2, figsize=(14, 15))
     
     # Color map for window sizes
@@ -1168,6 +1268,8 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
     for ws in window_sizes:
         ws_data = interventions[interventions['window_size'] == ws]
         means = [ws_data[ws_data['magnitude'] == m]['cb_dist_change'].mean() for m in magnitudes]
+        # Standard error of the mean; +1 in the denominator guards against a
+        # division by zero if a (window_size, magnitude) group is empty.
         stds = [ws_data[ws_data['magnitude'] == m]['cb_dist_change'].std() / 
                 np.sqrt(len(ws_data[ws_data['magnitude'] == m]) + 1) for m in magnitudes]
         ax.errorbar(magnitudes, means, yerr=stds, fmt='o-', label=f'w={ws}', 
@@ -1264,6 +1366,8 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
     
     # Contacts gained heatmap
     ax = axes[0]
+    # Build a long-form (window_size, window_start, mean_value) table, then pivot it
+    # into a 2D grid so it can be rendered as an image with imshow.
     pivot_data = []
     for ws in window_sizes:
         ws_data = interventions[interventions['window_size'] == ws]
@@ -1275,8 +1379,12 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
     
     if len(pivot_data) > 0:
         pivot_df = pd.DataFrame(pivot_data)
+        # Rows = window_size, columns = window_start; cells missing for a given
+        # (size, start) combo (e.g. larger windows have fewer valid starts) become NaN.
         pivot_table = pivot_df.pivot(index='window_size', columns='window_start', values='value')
         
+        # extent maps pixel edges to axis coordinates so gridlines/ticks line up with
+        # cell centers; vmin/vmax fix the diverging colormap's zero-point at "no change".
         im = ax.imshow(pivot_table.values, aspect='auto', cmap='RdYlGn', 
                        extent=[pivot_table.columns.min()-0.5, pivot_table.columns.max()+0.5,
                                len(window_sizes)-0.5, -0.5],
@@ -1304,6 +1412,9 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
         pivot_df = pd.DataFrame(pivot_data)
         pivot_table = pivot_df.pivot(index='window_size', columns='window_start', values='value')
         
+        # Asymmetric color range: pLDDT changes are expected to be mostly negative
+        # (steering can substantially degrade structure confidence) with only small
+        # positive gains possible, so the scale is skewed accordingly (-20 to +5).
         im = ax.imshow(pivot_table.values, aspect='auto', cmap='RdYlGn', 
                        extent=[pivot_table.columns.min()-0.5, pivot_table.columns.max()+0.5,
                                len(window_sizes)-0.5, -0.5],
@@ -1328,6 +1439,7 @@ def analyze_results(results_df: pd.DataFrame, output_dir: str):
 # ============================================================================
 
 def parse_args():
+    """Parse command-line arguments for the contact steering experiment script."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--probing_dataset', type=str,
                         default=os.path.join(_PROJECT_ROOT, 'data', 'probing_train_test.csv'),
@@ -1359,6 +1471,7 @@ def parse_args():
 
 
 def main():
+    """Train/load distance probes, then run the sliding-window contact steering sweep and analysis."""
     args = parse_args()
     
     os.makedirs(args.output, exist_ok=True)
@@ -1374,9 +1487,7 @@ def main():
     print(f"Pairs per protein: {args.n_pairs_per_protein}")
     
     # Load model
-    print("\nLoading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    model, tokenizer = load_esmfold(device)
 
     # =========================================================================
     # STEP 1: Train or Load Probes
@@ -1454,7 +1565,7 @@ def main():
 
         print(f"\nTest sequences after filtering: {len(test_seqs)}")
 
-        # Evaluate using imported function
+        # Evaluate using imported function (cap at 50 sequences to keep evaluation fast)
         eval_df = evaluate_probes_online(
             probes=directions.probes,
             sequences=test_seqs[:50],

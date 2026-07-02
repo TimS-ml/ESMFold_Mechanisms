@@ -33,11 +33,14 @@ from matplotlib.gridspec import GridSpec
 from tqdm import tqdm
 
 from transformers import EsmForProteinFolding, AutoTokenizer
+from src.utils.model_utils import load_esmfold  # shared loader: handles precision/device/eval-mode setup
 from transformers.models.esm.modeling_esmfold import (
     EsmFoldingTrunk, 
     EsmForProteinFoldingOutput,
     EsmFoldStructureModule,
 )
+# Rigid/Rotation: OpenFold-style rigid-body (rotation + translation) transform utilities used
+# below to hand-replicate the structure module's per-block backbone frame update math.
 from transformers.models.esm.openfold_utils import Rigid, Rotation
 
 
@@ -63,15 +66,21 @@ def compute_ca_distances(positions: torch.Tensor) -> torch.Tensor:
         Distance matrix
     """
     if positions.dim() == 3:
+        # Add a batch dim if a single (unbatched) structure was passed, so the rest of the
+        # function can always assume a leading batch axis.
         positions = positions.unsqueeze(0)
     
     # CA is atom index 1
+    # (atom14 layout: N=0, CA=1, C=2, O=3, then side-chain atoms - CA is always index 1)
     ca_pos = positions[:, :, 1, :]  # [batch, seq_len, 3]
     
     # Compute pairwise distances
+    # (broadcast outer difference over the seq_len axis -> all pairwise displacement vectors)
     diff = ca_pos.unsqueeze(2) - ca_pos.unsqueeze(1)
-    distances = torch.sqrt((diff ** 2).sum(-1) + 1e-8)
+    distances = torch.sqrt((diff ** 2).sum(-1) + 1e-8)  # +1e-8 avoids NaN at sqrt(0) on the diagonal
     
+    # Undo the batch dim we may have added above, so single-structure callers get back a plain
+    # [seq_len, seq_len] matrix instead of a [1, seq_len, seq_len] one.
     return distances.squeeze(0) if distances.shape[0] == 1 else distances
 
 
@@ -80,12 +89,13 @@ def compute_radius_of_gyration(positions: torch.Tensor, start: int, end: int) ->
     if positions.dim() == 3:
         positions = positions.unsqueeze(0)
     
+    # Indexes batch element 0 only (this script always runs one sequence at a time, so B == 1).
     ca_pos = positions[0, start:end, 1, :]
-    com = ca_pos.mean(dim=0)
+    com = ca_pos.mean(dim=0)  # center of mass of the region
     diff = ca_pos - com
     rg = torch.sqrt((diff ** 2).sum(-1).mean())
     
-    return rg.item()
+    return rg.item()  # not used for backprop, so .item() (plain float) is fine here
 
 
 def compute_strand_separation(positions: torch.Tensor, hp_start: int, hp_end: int) -> float:
@@ -98,6 +108,9 @@ def compute_strand_separation(positions: torch.Tensor, hp_start: int, hp_end: in
     
     ca_pos = positions[0, hp_start:hp_end, 1, :]
     
+    # Assumes an antiparallel beta-hairpin: pairs residue i (from the N-terminal strand) with
+    # residue (hp_len-1-i) (the mirrored position on the C-terminal strand). `i < j` skips the
+    # middle residue when hp_len is odd (i == j there) and avoids counting each pair twice.
     separations = []
     for i in range(half_len):
         j = hp_len - 1 - i
@@ -110,6 +123,7 @@ def compute_strand_separation(positions: torch.Tensor, hp_start: int, hp_end: in
 
 def compute_contact_map(positions: torch.Tensor, threshold: float = 8.0) -> torch.Tensor:
     """Compute binary contact map (CA-CA < threshold)."""
+    # 8.0 A is a standard CA-CA contact-distance cutoff used in protein structure analysis.
     distances = compute_ca_distances(positions)
     contacts = (distances < threshold).float()
     return contacts
@@ -118,6 +132,8 @@ def compute_contact_map(positions: torch.Tensor, threshold: float = 8.0) -> torc
 # ============================================================================
 # DIFFERENTIABLE GEOMETRY UTILITIES (for gradient computation)
 # ============================================================================
+# Unlike the plain versions above (which call .item() and return Python floats), these stay as
+# tensors end to end, so autograd can trace a path from the metric back to z_scale/s_scale.
 def compute_mean_ca_distance_differentiable(positions: torch.Tensor) -> torch.Tensor:
     """Compute mean CA-CA distance (differentiable, returns scalar tensor)."""
     if positions.dim() == 3:
@@ -125,8 +141,9 @@ def compute_mean_ca_distance_differentiable(positions: torch.Tensor) -> torch.Te
 
     ca_pos = positions[:, :, 1, :]
     diff = ca_pos.unsqueeze(2) - ca_pos.unsqueeze(1)
-    distances = torch.sqrt((diff ** 2).sum(-1) + 1e-8)
+    distances = torch.sqrt((diff ** 2).sum(-1) + 1e-8)  # +1e-8 avoids NaN gradient at sqrt(0)
 
+    # triu(diagonal=1): each unique (i<j) pair counted once, skipping the zero-valued diagonal.
     seq_len = distances.shape[1]
     mask = torch.triu(torch.ones(seq_len, seq_len, device=distances.device), diagonal=1)
     n_pairs = mask.sum()
@@ -138,10 +155,11 @@ def compute_radius_of_gyration_differentiable(positions: torch.Tensor, start: in
     if positions.dim() == 3:
         positions = positions.unsqueeze(0)
 
+    # Batch element 0 only (this script always runs one sequence at a time, so B == 1).
     ca_pos = positions[0, start:end, 1, :]
     com = ca_pos.mean(dim=0)
     diff = ca_pos - com
-    return torch.sqrt((diff ** 2).sum(-1).mean() + 1e-8)
+    return torch.sqrt((diff ** 2).sum(-1).mean() + 1e-8)  # +1e-8 avoids NaN gradient at sqrt(0)
 
 
 def compute_local_ca_distance_differentiable(positions: torch.Tensor, start: int, end: int) -> torch.Tensor:
@@ -153,10 +171,11 @@ def compute_local_ca_distance_differentiable(positions: torch.Tensor, start: int
     diff = ca_pos.unsqueeze(1) - ca_pos.unsqueeze(0)
     distances = torch.sqrt((diff ** 2).sum(-1) + 1e-8)
 
+    # Same upper-triangle trick: count each residue pair within the region exactly once.
     region_len = distances.shape[0]
     mask = torch.triu(torch.ones(region_len, region_len, device=distances.device), diagonal=1)
     n_pairs = mask.sum()
-    return (distances * mask).sum() / (n_pairs + 1e-8)
+    return (distances * mask).sum() / (n_pairs + 1e-8)  # +1e-8 also guards region_len<2 (n_pairs=0)
 
 
 # ============================================================================
@@ -179,6 +198,11 @@ def get_trunk_outputs(model, tokenizer, device, sequence: str, num_recycles: int
     Run ESMFold up to (but not including) the structure module.
     Returns the intermediate representations that would be fed to the structure module.
     """
+    # The entire trunk forward pass (ESM-2 encoder, all evoformer-like blocks, and every recycle
+    # iteration) runs under torch.no_grad(), so no autograd graph is built for any of it. This is
+    # intentionally a fixed feature-extraction pass; gradients (in compute_scale_gradient below)
+    # are only introduced later via a fresh scale parameter applied inside the structure module,
+    # which keeps the eventual backward pass cheap (it never has to touch the trunk or ESM-2).
     with torch.no_grad():
         inputs = tokenizer(sequence, return_tensors='pt', add_special_tokens=False).to(device)
         input_ids = inputs['input_ids']
@@ -189,61 +213,86 @@ def get_trunk_outputs(model, tokenizer, device, sequence: str, num_recycles: int
         aa = input_ids
         B, L = aa.shape
 
-        esmaa = model.af2_idx_to_esm_idx(aa, attention_mask)
-        esm_s = model.compute_language_model_representations(esmaa)
-        esm_s = esm_s.to(model.esm_s_combine.dtype)
+        esmaa = model.af2_idx_to_esm_idx(aa, attention_mask)  # remap AF2 vocab ids -> ESM-2 vocab ids
+        esm_s = model.compute_language_model_representations(esmaa)  # runs full 36-layer ESM-2 encoder
+        esm_s = esm_s.to(model.esm_s_combine.dtype)  # match dtype of the learned per-layer mixing weights below
 
         if cfg.esm_ablate_sequence:
-            esm_s = esm_s * 0
+            esm_s = esm_s * 0  # config-gated ablation switch (unused here, inherited from base model forward)
 
-        esm_s = esm_s.detach()
+        esm_s = esm_s.detach()  # no-op under no_grad(); kept to mirror the original model code exactly
 
+        # esm_s_combine: one learned scalar weight per ESM-2 layer; softmax -> convex combination
+        # across layers, then matmul collapses the per-layer axis into a single per-residue vector.
         esm_s = (model.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2)
-        s_s_0 = model.esm_s_mlp(esm_s)
-        s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)
+        s_s_0 = model.esm_s_mlp(esm_s)  # project combined ESM-2 features down to the trunk's working dim (c_s)
+        s_z_0 = s_s_0.new_zeros(B, L, L, cfg.trunk.pairwise_state_dim)  # pairwise state starts at zero
 
         if model.config.esmfold_config.embed_aa:
-            s_s_0 = s_s_0 + model.embedding(aa)
+            s_s_0 = s_s_0 + model.embedding(aa)  # optionally add a raw learned per-amino-acid identity embedding
 
         trunk = model.trunk
 
+        # "+1": the first trunk pass is the ordinary forward pass, not itself a "recycle"
+        # (recycling = extra passes that feed back the previous pass's output as input).
         no_recycles = num_recycles if num_recycles is not None else trunk.config.max_recycles
         no_recycles += 1
 
         s_s = s_s_0
         s_z = s_z_0
+        # Zero-initialized so the first iteration's "recycled" contribution below is a no-op.
         recycle_s = torch.zeros_like(s_s)
         recycle_z = torch.zeros_like(s_z)
         recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
 
         def trunk_iter(s, z, residx, mask):
+            """Add relative-position pairwise embedding, then run one pass through all trunk blocks."""
             z = z + trunk.pairwise_positional_embedding(residx, mask=mask)
             for block in trunk.blocks:
                 s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=trunk.chunk_size)
             return s, z
 
         for recycle_idx in range(no_recycles):
+            # .detach() calls here are inert given the outer no_grad(), but mirror the real
+            # EsmFoldingTrunk.forward (which only wraps non-final recycle iterations in no_grad
+            # and needs an explicit detach between iterations). Divergence from the real model:
+            # this helper forces EVERY iteration, including the last, through no_grad, since no
+            # trunk-level gradients are needed for this experiment.
             recycle_s = trunk.recycle_s_norm(recycle_s.detach())
             recycle_z = trunk.recycle_z_norm(recycle_z.detach())
+            # Embed the previous iteration's predicted CA-CA distance histogram as an additive
+            # pairwise feature - this is how coordinates from the last recycle feed back into z.
             recycle_z = recycle_z + trunk.recycle_disto(recycle_bins.detach())
 
             s_s, s_z = trunk_iter(s_s_0 + recycle_s, s_z_0 + recycle_z, position_ids, attention_mask)
 
             if recycle_idx < no_recycles - 1:
+                # Calls the ORIGINAL (unscaled) structure module purely to get positions for the
+                # next iteration's recycling distogram; unrelated to the scaling experiment below.
+                # Skipped on the final iteration since there is no next iteration to feed.
                 structure = trunk.structure_module(
                     {"single": trunk.trunk2sm_s(s_s), "pair": trunk.trunk2sm_z(s_z)},
                     aa, attention_mask.float(),
                 )
                 recycle_s = s_s
                 recycle_z = s_z
+                # positions[-1]: final IPA block's coords. [:, :, :3] keeps only N, CA, C (atom14
+                # indices 0-2), needed to infer CB and bin distances. 3.375/21.375 A are
+                # AlphaFold's standard distogram bin-range bounds; trunk.recycle_bins (=15) is
+                # the number of bins.
                 recycle_bins = trunk.distogram(
                     structure["positions"][-1][:, :, :3],
                     3.375, 21.375, trunk.recycle_bins,
                 )
 
+        # These are the actual tensors the real model feeds into the structure module, and the
+        # ones the scaling/gradient experiments below manipulate.
         s_s_proj = trunk.trunk2sm_s(s_s)
         s_z_proj = trunk.trunk2sm_z(s_z)
 
+        # Detach everything before returning - redundant given the outer no_grad() (nothing here
+        # has a grad_fn anyway), but makes explicit that the returned tensors are plain constants
+        # with no ties back into this trunk computation.
         return TrunkOutputs(
             s_s=s_s.detach(), s_z=s_z.detach(),
             s_s_proj=s_s_proj.detach(), s_z_proj=s_z_proj.detach(),
@@ -265,6 +314,8 @@ def _run_structure_module_with_scale(
     """
     from transformers.models.esm.modeling_esmfold import dict_multimap
 
+    # Scale exactly one of z/s (selected by scale_target) and leave the other at its normed,
+    # unscaled value - keeps the two perturbations orthogonal so their effects are separable.
     if scale_target == 'z':
         z_input = z_normed * scale_param
         s_input = s_normed
@@ -272,12 +323,18 @@ def _run_structure_module_with_scale(
         z_input = z_normed
         s_input = s_normed * scale_param
 
-    s_initial = s_input
+    s_initial = s_input  # angle_resnet needs whichever s was actually used going forward (scaled or not)
     s_current = structure_module.linear_in(s_input)
 
+    # Identity rotation+translation frame per residue - the starting backbone frame before any
+    # IPA block has run.
     rigids = Rigid.identity(s_current.shape[:-1], s_current.dtype, s_current.device,
                            structure_module.training, fmt="quat")
     outputs = []
+    # Re-implementation of EsmFoldStructureModule.forward's block loop (can't call it directly -
+    # it has no hook for injecting a scale factor). z_input/s_input (one of which carries the
+    # scale_param perturbation) feed into IPA each of the `num_blocks` iterations; only the LAST
+    # block's positions are used below (positions[-1]).
     for i in range(structure_module.config.num_blocks):
         s_current = s_current + structure_module.ipa(s_current, z_input, rigids, mask)
         s_current = structure_module.ipa_dropout(s_current)
@@ -286,10 +343,13 @@ def _run_structure_module_with_scale(
 
         rigids = rigids.compose_q_update_vec(structure_module.bb_update(s_current))
 
+        # Convert quaternion-based rigids to rotation-matrix form to match AlphaFold's convention.
         backb_to_global = Rigid(
             Rotation(rot_mats=rigids.get_rots().get_rot_mats(), quats=None),
             rigids.get_trans(),
         )
+        # trans_scale_factor rescales from the model's internal (roughly unit-scale) training
+        # coordinates back up to physical Angstrom units.
         backb_to_global = backb_to_global.scale_translation(structure_module.config.trans_scale_factor)
 
         unnormalized_angles, angles = structure_module.angle_resnet(s_current, s_initial)
@@ -307,10 +367,17 @@ def _run_structure_module_with_scale(
             "states": s_current,
         }
         outputs.append(preds)
+        # Detach ONLY the rotation component before the next block (standard AlphaFold/OpenFold
+        # stabilization trick): prevents rotation gradients from compounding across num_blocks
+        # iterations, while translation gradients still flow normally. A second, separate
+        # gradient-truncation point inside the structure module itself (distinct from the
+        # trunk-level no_grad() truncation done earlier in get_trunk_outputs).
         rigids = rigids.stop_rot_gradient()
 
+    # Stack the per-block dicts into a single dict of tensors, each with a new leading
+    # num_blocks dimension (see dict_multimap in modeling_esmfold.py).
     outputs = dict_multimap(torch.stack, outputs)
-    return outputs["positions"][-1]
+    return outputs["positions"][-1]  # final block's positions: [B, N, 14, 3]
 
 
 def _compute_metric(positions, metric, hp_start=None, hp_end=None):
@@ -345,11 +412,17 @@ def compute_scale_gradient(
     device = trunk_outputs.s_s_proj.device
     dtype = trunk_outputs.s_z_proj.dtype
 
+    # .clone() a fresh copy of the (already-detached, no-grad) cached trunk tensors:
+    # trunk_outputs may be reused across many scale values/metrics, and cloning avoids autograd
+    # in-place/version issues from starting multiple independent graphs off the same storage.
     s = trunk_outputs.s_s_proj.clone()
     z = trunk_outputs.s_z_proj.clone()
     aa = trunk_outputs.aa
     mask = trunk_outputs.mask
 
+    # The only leaf tensor with requires_grad=True here. Since s/z/aa are plain constants,
+    # autograd only builds a graph along the path flowing through scale_param - i.e. just the
+    # structure module ops in _run_structure_module_with_scale, not the trunk that produced s/z.
     scale_param = torch.tensor(scale_value, dtype=dtype, device=device, requires_grad=True)
 
     sm = model.trunk.structure_module
@@ -365,9 +438,11 @@ def compute_scale_gradient(
     )
 
     metric_value = _compute_metric(positions, metric, hp_start, hp_end)
+    # Since scale_param is the only requires_grad leaf feeding into metric_value, this is a cheap
+    # backward pass through just the structure module, not the trunk or ESM-2 encoder.
     metric_value.backward()
 
-    gradient = scale_param.grad
+    gradient = scale_param.grad  # d(metric_value) / d(scale_param), accumulated into the leaf's .grad
     gradient_value = gradient.item() if gradient is not None else 0.0
 
     return {
@@ -389,11 +464,16 @@ def compute_both_gradients(
     z_results = []
     s_results = []
 
+    # scale=1.0 is the "operating point": the model's actual, unperturbed behavior. Local
+    # sensitivity (gradient) there is the most directly meaningful reading of "how much does
+    # geometry change per unit change in z/s scale" for the model as it's normally used.
     for metric in metrics:
         try:
             z_results.append(compute_scale_gradient(
                 model, trunk_outputs, 1.0, metric, 'z', hp_start, hp_end))
         except Exception as e:
+            # Substitute a NaN row instead of aborting the whole loop, so one failing metric
+            # doesn't lose results for the others; downstream pandas aggregations skip NaNs.
             print(f"Z gradient error: metric={metric}: {e}")
             z_results.append({'metric': metric, 'z_scale': 1.0,
                               'metric_value': float('nan'), 'gradient': float('nan')})
@@ -427,7 +507,19 @@ def create_scaled_sm_forward(
     """
     from transformers.models.esm.modeling_esmfold import dict_multimap
     
+    # This closure captures s_scale/z_scale from the enclosing function's arguments - a factory
+    # pattern that lets us parametrize a monkey-patched replacement method without a class.
+    # Unlike compute_scale_gradient above (which hand-runs the structure module under a fresh,
+    # tiny autograd graph for gradients), this is used for the discrete-sweep experiment: the
+    # whole model is called normally (see run_with_scaling), and this forward is patched in only
+    # to inject a fixed scale multiplier - no gradients needed here.
     def modified_forward(self_sm, evoformer_output_dict, aatype, mask=None, _offload_inference=False):
+        """Structure module forward pass with s/z scaled by s_scale/z_scale after layer norm."""
+        # _offload_inference accepted for signature parity with the real forward, but the
+        # _offload_inference=True CPU-offload branch (see real EsmFoldStructureModule.forward)
+        # is not reimplemented here - always behaves as if False. Confirmed harmless for how this
+        # is actually invoked: run_with_scaling below only calls the top-level model(...), whose
+        # own trunk.forward always calls structure_module with the (default) False.
         # Get s and z from evoformer output
         s = evoformer_output_dict["single"]
         z = evoformer_output_dict["pair"]
@@ -440,6 +532,7 @@ def create_scaled_sm_forward(
         z = self_sm.layer_norm_z(z)
         
         # SCALE S AND Z HERE - this is the key intervention
+        # (applied after layer norm - scaling before it would just get normalized back away)
         s = s * s_scale
         z = z * z_scale
         
@@ -449,6 +542,8 @@ def create_scaled_sm_forward(
         rigids = Rigid.identity(s.shape[:-1], s.dtype, s.device, self_sm.training, fmt="quat")
         outputs = []
         
+        # Re-implementation of EsmFoldStructureModule.forward's block loop (this whole function
+        # replaces structure_module.forward via types.MethodType in run_with_scaling below).
         for i in range(self_sm.config.num_blocks):
             s = s + self_sm.ipa(s, z, rigids, mask)
             s = self_sm.ipa_dropout(s)
@@ -478,10 +573,14 @@ def create_scaled_sm_forward(
                 "states": s,
             }
             outputs.append(preds)
+            # stop_rot_gradient(): detaches only the rotation component before the next block
+            # (standard AlphaFold/OpenFold stabilization trick). Doesn't matter for gradients
+            # here (this path runs under no_grad(), see run_with_scaling), but kept for parity
+            # with the real EsmFoldStructureModule.forward.
             rigids = rigids.stop_rot_gradient()
         
         outputs = dict_multimap(torch.stack, outputs)
-        outputs["single"] = s
+        outputs["single"] = s  # matches the real forward, which also returns the final "single" state
         return outputs
     
     return modified_forward
@@ -502,17 +601,25 @@ def run_with_scaling(
     original_sm_forward = model.trunk.structure_module.forward
     
     # Patch with scaled version
+    # types.MethodType binds the closure as an instance method on the SAME structure module
+    # instance, so `self_sm` inside modified_forward is the real module (with working access to
+    # self_sm.ipa, self_sm.layer_norm_s, etc.), exactly as if it were the original bound method.
     model.trunk.structure_module.forward = types.MethodType(
         create_scaled_sm_forward(s_scale=s_scale, z_scale=z_scale),
         model.trunk.structure_module
     )
     
     try:
+        # no_grad(): only the resulting geometry is needed here, not gradients - this is the
+        # discrete-sweep experiment, distinct from the autograd-based gradient functions above.
         with torch.no_grad():
             inputs = tokenizer(sequence, return_tensors='pt', add_special_tokens=False).to(device)
-            outputs = model(**inputs, num_recycles=0)
+            outputs = model(**inputs, num_recycles=0)  # num_recycles=0: single trunk pass, keeps runs comparable
     finally:
         # Restore original
+        # try/finally guarantees this runs even if the call above raises - since this function is
+        # invoked in a loop over many scale values (run_scaling_comparison below), leaving the
+        # patch in place after a failure would silently corrupt later calls with a stale scale.
         model.trunk.structure_module.forward = original_sm_forward
     
     return outputs
@@ -536,10 +643,14 @@ def run_scaling_comparison(
     # First, get baseline (scale=1.0 for both)
     print("  Getting baseline...")
     baseline_outputs = run_with_scaling(model, tokenizer, device, sequence, s_scale=1.0, z_scale=1.0)
+    # positions[-1]: final structure-module block; [..., 0]: first (only) batch element ->
+    # [N_res, 14, 3]. Reused as the reference for every scaled run below.
     baseline_pos = baseline_outputs.positions[-1, 0]
     baseline_contacts = compute_contact_map(baseline_pos)
     
     # Scale z only
+    # (s pinned at 1.0; s is scaled on its own further below with z pinned at 1.0 - keeps the two
+    # representations' effects orthogonal/separable for a valid ceteris-paribus comparison)
     print("  Scaling z (pair representations)...")
     for scale in tqdm(scales, desc="Z scaling", leave=False):
         outputs = run_with_scaling(model, tokenizer, device, sequence, s_scale=1.0, z_scale=scale)
@@ -552,6 +663,9 @@ def run_scaling_comparison(
         metrics['scaled_repr'] = 'z (pair)'
         z_results.append(metrics)
         
+        # Frees cached (unused) GPU memory back to the driver between runs - not strictly needed
+        # per-call, but avoids fragmentation/OOM over the many sequences x scales x cases this
+        # experiment loops over (see run_z_vs_s_experiment).
         torch.cuda.empty_cache()
     
     # Scale s only
@@ -597,10 +711,16 @@ def compute_structure_metrics(
     baseline_ca = baseline_positions[:, 1, :]
     
     # Simple RMSD (no alignment)
+    # (coordinates are compared directly, with no rotation/translation superposition first, so a
+    # rigid-body shift between the scaled and baseline structures would itself show up as RMSD -
+    # acceptable here since s/z scaling is expected to act directly on absolute coordinates)
     rmsd_all = torch.sqrt(((ca_pos - baseline_ca) ** 2).sum(-1).mean()).item()
     rmsd_hairpin = torch.sqrt(((ca_pos[hp_start:hp_end] - baseline_ca[hp_start:hp_end]) ** 2).sum(-1).mean()).item()
     
     # Contact map comparison
+    # precision: of the contacts predicted in this (scaled) structure, fraction also present in
+    # baseline. recall: of the contacts present in baseline, fraction recovered here. +1e-8 avoids
+    # divide-by-zero if a structure ends up with zero contacts (e.g. fully unfolded by scaling).
     contacts = compute_contact_map(positions)
     contact_precision = ((contacts == 1) & (baseline_contacts == 1)).sum() / (contacts.sum() + 1e-8)
     contact_recall = ((contacts == 1) & (baseline_contacts == 1)).sum() / (baseline_contacts.sum() + 1e-8)
@@ -742,6 +862,7 @@ def plot_z_vs_s_comparison(
     
     # Compute sensitivity as (max - min) / baseline for key metrics
     def compute_sensitivity(results, metric):
+        """Relative sensitivity: (max-min across scales) / value at the scale=1.0 baseline."""
         baseline_val = results.loc[results['scale'] == 1.0, metric].values[0]
         if baseline_val == 0:
             return 0
@@ -754,6 +875,8 @@ def plot_z_vs_s_comparison(
     z_sensitivities = [compute_sensitivity(z_results, m) for m in metrics_to_compare]
     s_sensitivities = [compute_sensitivity(s_results, m) for m in metrics_to_compare]
     
+    # Standard grouped-bar-chart layout: one tick per metric at integer position x, with the
+    # z/s bars offset by +/- half the bar width so they sit side by side without overlapping.
     x = np.arange(len(metric_labels))
     width = 0.35
     
@@ -785,6 +908,8 @@ def plot_summary_across_cases(
     fig, axes = plt.subplots(2, 4, figsize=(18, 10))
     
     # Select only numeric columns for aggregation
+    # all_z_results/all_s_results also carry non-numeric columns (case_name, scaled_repr, ...)
+    # which would break/warn under a numeric .agg(['mean', 'std']) - restrict to numeric_cols first.
     numeric_cols = ['scale', 'hairpin_rg', 'full_rg', 'strand_sep', 'hairpin_mean_ca_dist',
                     'full_mean_ca_dist', 'rmsd_all', 'rmsd_hairpin', 'contact_precision', 
                     'contact_recall', 'mean_plddt', 'hairpin_plddt']
@@ -793,6 +918,9 @@ def plot_summary_across_cases(
     s_numeric = all_s_results[numeric_cols]
     
     # Group by scale
+    # .agg(['mean', 'std']) on a DataFrame produces MultiIndex columns: top level = original
+    # column name (e.g. 'hairpin_rg'), second level = stat name ('mean'/'std'). Indexed below via
+    # z_grouped[(metric, 'mean')] etc.
     z_grouped = z_numeric.groupby('scale').agg(['mean', 'std'])
     s_grouped = s_numeric.groupby('scale').agg(['mean', 'std'])
     scales = z_grouped.index.values
@@ -851,6 +979,8 @@ def plot_effect_size_comparison(
     s_baseline = all_s_results[all_s_results['scale'] == 1.0][metrics].mean()
     
     # Left plot: Effect size at extreme scales (0.0 and 2.0)
+    # 0.0 = representation fully zeroed out, 2.0 = doubled; the two most extreme perturbation
+    # conditions in `scales`, used here as a quick "how much does this matter" summary.
     ax = axes[0]
     
     extreme_scales = [0.0, 2.0]
@@ -872,6 +1002,9 @@ def plot_effect_size_comparison(
     ax.bar(x - width/2, bar_data['z'], width, label='z (pair)', color='steelblue')
     ax.bar(x + width/2, bar_data['s'], width, label='s (single)', color='indianred')
     
+    # Label order here (scale outer loop, metric inner loop) must match the order bar_data was
+    # filled above (also scale-outer/metric-inner) - `metrics` and this label list are also kept
+    # in the same 1:1 order (hairpin_rg->HP_RG, full_rg->Full_RG, ...).
     labels = [f'{m}\n(s={s})' for s in extreme_scales for m in ['HP_RG', 'Full_RG', 'Strand', 'RMSD', 'HP_CA', 'Full_CA']]
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
@@ -948,11 +1081,16 @@ def plot_running_averages(
     metric_labels = ['Hairpin RG (Å)', 'Full RG (Å)', 'Strand Sep (Å)', 'HP CA Dist (Å)', 'Full CA Dist (Å)', 'RMSD (Å)']
     
     # Checkpoints to plot
+    # e.g. plot_every_n=10 -> [10, 20, 30, ...]; the final append ensures the last, "all cases"
+    # checkpoint is always included even when n_total_cases isn't an exact multiple of
+    # plot_every_n, so there's always a plot reflecting the complete/converged result.
     checkpoints = list(range(plot_every_n, n_total_cases + 1, plot_every_n))
     if n_total_cases not in checkpoints:
         checkpoints.append(n_total_cases)
     
     # For each checkpoint, compute and plot average results
+    # (re-aggregates over a growing prefix of cases - an expanding window - so the saved plots
+    # show how the mean/std stabilize ("converge") as more cases are included)
     for n_cases in checkpoints:
         cases_to_include = case_indices[:n_cases]
         
@@ -1014,6 +1152,9 @@ def plot_metric_convergence(
     """
     Plot how the Z/S effect ratio converges as more cases are added.
     """
+    # Tests whether the "which representation matters more" conclusion is robust across sample
+    # size, or just an artifact of small n (as opposed to plot_running_averages, which tracks raw
+    # metric values rather than the summary z/s ratio).
     case_indices = sorted(all_z_results['case_idx'].unique())
     
     metrics = ['hairpin_rg', 'full_rg', 'strand_sep', 'hairpin_mean_ca_dist', 'full_mean_ca_dist']
@@ -1052,10 +1193,16 @@ def plot_metric_convergence(
     ax = axes[1]
     final_ratios = [ratios_per_checkpoint[m][-1] for m in metrics]
     colors = ['steelblue' if r > 1 else 'indianred' for r in final_ratios]
-    bars = ax.bar(metric_labels, final_ratios, color=colors)
+    bars = ax.bar(metric_labels, final_ratios, color=colors)  # categorical x-axis (string labels)
     ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
     ax.set_ylabel('Z/S Effect Ratio')
     ax.set_title(f'Final Z/S Ratios ({checkpoints[-1]} Cases)')
+    # NOTE: possible bug -- set_xticklabels() is called here without a preceding set_xticks()
+    # call, unlike every other bar chart in this file (which always pairs set_xticks + 
+    # set_xticklabels). It happens to work because ax.bar() with string categories pre-creates
+    # one tick per bar, but current matplotlib emits: "UserWarning: set_ticklabels() should only
+    # be used with a fixed number of ticks, i.e. after set_ticks() or using a FixedLocator."
+    # (verified empirically). Harmless today, but fragile if bar() ever stops auto-fixing ticks.
     ax.set_xticklabels(metric_labels, rotation=45, ha='right')
     
     # Add value labels on bars
@@ -1100,10 +1247,7 @@ def run_z_vs_s_experiment(
     gradient_metrics = ['mean_ca_dist', 'full_rg', 'hairpin_ca_dist', 'hairpin_rg']
 
     # Load model
-    print("Loading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
-    print("Model loaded.")
+    model, tokenizer = load_esmfold(device)
 
     # Load data
     print(f"\nLoading data from {parquet_path}...")
@@ -1135,6 +1279,7 @@ def run_z_vs_s_experiment(
         print(f"{'='*60}")
 
         # Run scaling comparison
+        # Discrete sweep (monkey-patched forward, no gradients) - see run_scaling_comparison.
         z_results, s_results = run_scaling_comparison(
             model, tokenizer, device, target_seq,
             hp_start, hp_end,
@@ -1154,6 +1299,9 @@ def run_z_vs_s_experiment(
         plot_z_vs_s_comparison(z_results, s_results, output_dir, case_name)
 
         # Compute gradients
+        # Autograd-based analysis at the operating point (scale=1.0) - see compute_scale_gradient.
+        # get_trunk_outputs runs the (expensive) trunk pass once per case; compute_both_gradients
+        # then reuses it for every metric via cheap structure-module-only re-runs.
         print("  Computing gradients...")
         trunk_outputs = get_trunk_outputs(model, tokenizer, device, target_seq, num_recycles=0)
 
@@ -1170,6 +1318,9 @@ def run_z_vs_s_experiment(
         all_z_grad_results.append(z_grad_results)
         all_s_grad_results.append(s_grad_results)
 
+        # Explicit cleanup: trunk_outputs holds several large per-residue/pairwise tensors, and
+        # this loop may run over hundreds of cases (see DEFAULT_N_CASES) - del + empty_cache
+        # prevents cumulative GPU memory growth across iterations.
         del trunk_outputs
         torch.cuda.empty_cache()
 
@@ -1236,6 +1387,7 @@ def run_z_vs_s_experiment(
 # MAIN ENTRY POINT
 # ============================================================================
 def main():
+    """CLI entry point: parse arguments and run the full z vs s scaling + gradient experiment."""
     parser = argparse.ArgumentParser(
         description="Compare effects of scaling z (pair) vs s (single) representations"
     )

@@ -36,6 +36,9 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 from transformers import EsmForProteinFolding, AutoTokenizer
+# Note: categorical_lddt, compute_predicted_aligned_error, compute_tm, and
+# make_atom14_masks are imported below but not directly used in this file
+# (EsmFoldingTrunk and EsmForProteinFoldingOutput are used).
 from transformers.models.esm.modeling_esmfold import (
     categorical_lddt,
     EsmFoldingTrunk,
@@ -49,7 +52,10 @@ from transformers.models.esm.openfold_utils import (
 from transformers.utils import ContextManagers
 
 from src.utils.trunk_utils import detect_hairpins
+# Collection classes imported from the shared utils module (unlike
+# module_patching.py, which keeps its own local copies of these).
 from src.utils.representation_utils import CollectedRepresentations, TrunkHooks
+from src.utils.model_utils import load_esmfold  # shared model+tokenizer loader (handles device/precision setup)
 
 
 # ============================================================================
@@ -66,6 +72,9 @@ def run_and_collect(
     """
     Run model and collect trunk representations using hooks.
     """
+    # Only trunk (s, z) hooks are needed here -- unlike module_patching.py's
+    # run_and_collect, single-block patching never touches the ESM encoder or
+    # structure-module IPA, so those collectors are skipped entirely.
     collector = CollectedRepresentations()
     
     trunk_hooks = TrunkHooks(model.trunk, collector)
@@ -73,9 +82,15 @@ def run_and_collect(
     
     try:
         with torch.no_grad():
+            # add_special_tokens=False: tokenizer's own CLS/EOS are omitted so
+            # positions line up 1:1 with residue indices for the trunk's
+            # mask/residx (see module_patching.py's run_and_collect for the
+            # fuller note on ESMFold's separate internal BOS/EOS handling,
+            # which doesn't apply here since only trunk, not ESM, is patched).
             inputs = tokenizer(sequence, return_tensors='pt', add_special_tokens=False).to(device)
             outputs = model(**inputs, num_recycles=num_recycles)
     finally:
+        # Always remove hooks, even if the forward pass above raised.
         trunk_hooks.remove()
     
     return outputs, collector
@@ -95,22 +110,35 @@ def create_pairwise_mask(
     mode: str,
 ) -> torch.Tensor:
     """Create pairwise patch mask."""
+    # Boolean mask over the target's [L, L] pairwise coordinate space.
     mask = torch.zeros(target_len, target_len, dtype=torch.bool)
     
     if mode == "intra":
+        # Only patch within the hairpin/patch region itself.
         mask[target_start:target_end, target_start:target_end] = True
         
     elif mode in ("touch", "hole"):
+        # How far the patched window can extend beyond the core region on
+        # each side while staying within both the donor's and target's
+        # sequence bounds (the smaller of the two limits keeps the coordinate
+        # mapping back to the donor, below, valid).
         left_extent = min(donor_start, target_start)
         right_extent = min(donor_len - donor_end, target_len - target_end)
         
         transport_start = target_start - left_extent
         transport_end = target_end + right_extent
         
+        # Cross ("+") pattern: rows = core patch region x cols = extended
+        # window, unioned with its transpose -- selects (i, j) pairs where
+        # either i or j is in the core region and the other spans the
+        # flanking context (interactions between patch and surrounding
+        # residues, not just interactions within the patch itself).
         mask[target_start:target_end, transport_start:transport_end] = True
         mask[transport_start:transport_end, target_start:target_end] = True
         
         if mode == "hole":
+            # "hole" = the cross minus the "intra" square: isolates just the
+            # core-to-context pairs, excluding core-to-core pairs.
             mask[target_start:target_end, target_start:target_end] = False
     
     return mask
@@ -146,26 +174,43 @@ def make_trunk_single_block_patch_forward(
         A forward function to be bound to model.trunk
     """
     
+    # Like module_patching.py's make_trunk_all_block_patch_forward, this whole
+    # `forward` reproduces the original EsmFoldingTrunk.forward
+    # (transformers.models.esm.modeling_esmfold) so the patched run stays
+    # numerically identical to a normal forward pass except at the patched
+    # positions. The one difference from the all-block version is
+    # apply_patch's early-return below, which restricts the intervention to a
+    # single block -- this is what lets the experiment isolate each block's
+    # individual causal contribution instead of patching all 48 at once.
     def forward(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
+        # seq_feats: [B, L, c_s] sequence repr; pair_feats: [B, L, L, c_z] pairwise repr.
         device = seq_feats.device
         s_s_0, s_z_0 = seq_feats, pair_feats
 
         if no_recycles is None:
             no_recycles = self.config.max_recycles
         else:
+            # First "recycle" is just the standard forward pass through the model.
             no_recycles += 1
 
         def apply_patch(block_idx, s, z):
             """Apply donor patch at this block (only if it's the target block)."""
+            # Core single-block restriction: every other block index is a no-op,
+            # so only `target_block`'s output ever gets overwritten.
             if block_idx != target_block:
                 return s, z
             
             # Patch sequence
+            # (overwrites s's [target_start:target_end] span with the donor's s
+            # at this same block index; requires equal-length donor/target regions)
             if patch_mode in ('both', 'sequence') and block_idx in donor_s_blocks:
                 donor_s = donor_s_blocks[block_idx].to(s.device, dtype=s.dtype)
                 s[:, target_start:target_end, :] = donor_s
             
             # Patch pairwise
+            # (for every (i, j) selected by pairwise_mask, defined in the
+            # target's coordinate space, copies the donor's z value at the
+            # corresponding donor-space coordinate, shifted by target_start -> donor_start)
             if patch_mode in ('both', 'pairwise') and block_idx in donor_z_blocks:
                 donor_z = donor_z_blocks[block_idx].to(z.device, dtype=z.dtype)
                 mask_dev = pairwise_mask.to(z.device)
@@ -175,6 +220,7 @@ def make_trunk_single_block_patch_forward(
                     ti, tj = indices[0][i].item(), indices[1][i].item()
                     di = ti - target_start + donor_start
                     dj = tj - target_start + donor_start
+                    # Skip if the mapped donor coordinate falls out of bounds.
                     if 0 <= di < donor_z.shape[1] and 0 <= dj < donor_z.shape[2]:
                         z[:, ti, tj, :] = donor_z[:, di, dj, :]
             
@@ -184,15 +230,22 @@ def make_trunk_single_block_patch_forward(
             z = z + self.pairwise_positional_embedding(residx, mask=mask)
             for block_idx, block in enumerate(self.blocks):
                 s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
+                # Intervention point: only fires for block_idx == target_block
+                # (see apply_patch's early return above).
                 s, z = apply_patch(block_idx, s, z)
             return s, z
 
+        # Standard recycle loop (unmodified from the original trunk forward):
+        # each recycle pass's final s/z and a coarse predicted-distance
+        # histogram feed back additively into the next pass's inputs.
         s_s, s_z = s_s_0, s_z_0
         recycle_s = torch.zeros_like(s_s)
         recycle_z = torch.zeros_like(s_z)
         recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
 
         for recycle_idx in range(no_recycles):
+            # Only the final recycle needs gradients; earlier ones are pure
+            # feed-forward inputs to the next iteration.
             with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
                 recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
                 recycle_z = self.recycle_z_norm(recycle_z.detach()).to(device)
@@ -206,6 +259,8 @@ def make_trunk_single_block_patch_forward(
                 )
 
                 recycle_s, recycle_z = s_s, s_z
+                # Bin predicted CB-CB distances (3.375-21.375 A, 15 bins) into a
+                # coarse distogram fed back into recycle_z on the next iteration.
                 recycle_bins = EsmFoldingTrunk.distogram(
                     structure["positions"][-1][:, :, :3],
                     3.375, 21.375, self.recycle_bins,
@@ -237,6 +292,9 @@ def patch_trunk_single_block(
         with patch_trunk_single_block(model, donor_s, donor_z, ..., target_block=5):
             outputs = model(**inputs)
     """
+    # The intervention needs to happen *inside* the trunk's recycling loop
+    # (between specific blocks), so a plain forward hook can't do it -- instead
+    # we temporarily swap out model.trunk's bound forward method.
     original = model.trunk.forward
     
     patched_forward = make_trunk_single_block_patch_forward(
@@ -244,11 +302,15 @@ def patch_trunk_single_block(
         target_start, target_end, donor_start,
         pairwise_mask, patch_mode, target_block,
     )
+    # types.MethodType binds the plain function as a method of this specific
+    # model.trunk instance so `self` resolves correctly inside it.
     model.trunk.forward = types.MethodType(patched_forward, model.trunk)
     
     try:
+        # Enter: forward is already monkey-patched by this point.
         yield
     finally:
+        # Exit (normal or exception): always restore the original forward.
         model.trunk.forward = original
 
 
@@ -263,8 +325,12 @@ def evaluate_hairpin(
     target_end: int,
 ) -> Dict[str, Any]:
     """Evaluate hairpin formation and structure quality."""
+    # Second return value (list of hairpin coordinate tuples) is discarded --
+    # only presence/absence is needed for this metric.
     hairpin_found, _ = detect_hairpins(outputs, model)
     
+    # outputs.plddt: [B, L] per-residue confidence in [0, 1]; [0] indexes the
+    # single-sequence batch dim.
     plddt = outputs.plddt[0].cpu().numpy()
     ptm = outputs.ptm.item() if outputs.ptm is not None else None
     
@@ -282,7 +348,18 @@ def evaluate_hairpin(
 
 def generate_summary_plots(results_df: pd.DataFrame, output_dir: str):
     """Generate summary plots from results."""
+    # NOTE: possible bug -- this function is defined but never called anywhere
+    # in this file; run_experiment_on_dataset() below calls
+    # generate_basic_plots() directly (both for periodic flushes and the final
+    # summary), bypassing this function entirely. Also, even if it were called,
+    # the import below would always raise ImportError anyway: src/block_plotting.py
+    # (as currently written) defines plot_formation_rate_lines/generate_all_plots/
+    # print_summary_statistics, not plot_success_rates/plot_success_rates_grouped/
+    # plot_plddt_comparison/plot_summary_table -- so the except-ImportError
+    # fallback to generate_basic_plots() below would trigger unconditionally.
     try:
+        # Bare `block_plotting` (not `src.block_plotting`) only resolves if the
+        # script's own directory happens to be on sys.path.
         from block_plotting import (
             plot_success_rates,
             plot_success_rates_grouped,
@@ -315,13 +392,15 @@ def generate_basic_plots(results_df: pd.DataFrame, output_dir: str):
     # Plot: Hairpin detection rate by block
     fig, ax = plt.subplots(figsize=(12, 5))
     
+    # hairpin_found is boolean, so groupby(...).mean() gives the fraction of
+    # True values per block -- i.e. each block's hairpin-formation success rate.
     block_success = results_df.groupby('block_idx')['hairpin_found'].mean()
     ax.bar(block_success.index, block_success.values, color='steelblue')
     ax.set_xlabel('Block Index')
     ax.set_ylabel('Hairpin Detection Rate')
     ax.set_title('Hairpin Detection Rate by Block')
     ax.set_ylim(0, 1)
-    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
+    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)  # 50% reference line
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "hairpin_by_block.png"), dpi=150)
@@ -330,6 +409,10 @@ def generate_basic_plots(results_df: pd.DataFrame, output_dir: str):
     # Plot: Hairpin detection by block × patch_mode
     fig, ax = plt.subplots(figsize=(14, 5))
     
+    # pivot_table reshapes the long-format results into a block_idx x
+    # patch_mode matrix of mean success rates -- one row per block, one
+    # column per patch_mode -- which pandas' .plot(kind='bar') below turns
+    # directly into a grouped bar chart (one group of bars per block).
     pivot = results_df.pivot_table(
         values='hairpin_found', 
         index='block_idx', 
@@ -348,12 +431,18 @@ def generate_basic_plots(results_df: pd.DataFrame, output_dir: str):
     plt.close()
     
     # Plot: Heatmap of success by block × mask_mode
+    # One subplot per unique patch_mode value.
     fig, axes = plt.subplots(1, len(results_df['patch_mode'].unique()), figsize=(16, 5))
+    # plt.subplots(1, N) returns a bare Axes (not an array) when N == 1, which
+    # isn't iterable; normalize that edge case into a list so the zip() loop
+    # below works the same regardless of how many patch_modes are present.
     if not hasattr(axes, '__len__'):
         axes = [axes]
     
     for ax, patch_mode in zip(axes, results_df['patch_mode'].unique()):
         subset = results_df[results_df['patch_mode'] == patch_mode]
+        # Per patch_mode, reshape into a patch_mask_mode x block_idx grid of
+        # mean success rates for the heatmap below.
         pivot = subset.pivot_table(
             values='hairpin_found',
             index='patch_mask_mode',
@@ -361,7 +450,11 @@ def generate_basic_plots(results_df: pd.DataFrame, output_dir: str):
             aggfunc='mean'
         )
         
+        # Deferred import: seaborn is only needed for this fallback plotting
+        # path, so it's imported here rather than at module load time.
         import seaborn as sns
+        # vmin/vmax fixed to [0, 1] (rather than auto-scaled) so the color
+        # scale is directly comparable across all patch_mode subplots.
         sns.heatmap(pivot, ax=ax, cmap='RdYlGn', vmin=0, vmax=1, 
                     annot=True, fmt='.2f', cbar_kws={'label': 'Success Rate'})
         ax.set_title(f'Patch Mode: {patch_mode}')
@@ -407,16 +500,19 @@ def run_experiment_on_dataset(
     print(f"Using device: {device}")
     
     # Load model
-    print("Loading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
-    model = model.to(device)
-    model.eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
-    print("Model loaded")
+    model, tokenizer = load_esmfold(device)
     
     # Load dataset
     print(f"Loading patching dataset from {parquet_path}...")
     df = pd.read_parquet(parquet_path)
+    # This "dataset" is actually the *results* parquet produced by
+    # module_patching.py's all-block experiment (see this file's --parquet
+    # default: "all_block_patching_results.parquet"). Filtering to
+    # patch_module == "trunk", hairpin_found == True, and patch_mask_mode ==
+    # "intra" keeps only the cases where whole-trunk patching already
+    # succeeded at forming a hairpin -- i.e. this single-block sweep only
+    # re-runs cases known to work at the whole-trunk level, to find *which*
+    # individual block(s) are responsible for that success.
     df = df[(df["patch_module"] == "trunk") & (df["hairpin_found"] == True) & (df['patch_mask_mode'] == 'intra')]
     if n_cases is not None:
         df = df.head(n_cases)
@@ -427,6 +523,8 @@ def run_experiment_on_dataset(
     results_path = os.path.join(output_dir, "single_block_patching_results.parquet")
     
     # Columns to preserve from input
+    # (carried through into every result row so each experiment result stays
+    # traceable back to its source case)
     preserve_cols = [
         "target_name", "target_sequence", "target_length",
         "loop_idx", "loop_start", "loop_end", "loop_length", "loop_sequence",
@@ -453,6 +551,8 @@ def run_experiment_on_dataset(
         print(f"  Donor hairpin: [{donor_start}:{donor_end})")
         
         # Preserve metadata
+        # (guarded by `if col in row.index` so this still works against input
+        # data that is missing an optional column)
         case_meta = {col: row[col] for col in preserve_cols if col in row.index}
         case_meta["case_idx"] = case_idx
         case_meta["target_start"] = target_start
@@ -469,16 +569,23 @@ def run_experiment_on_dataset(
         )
         
         # Extract hairpin region for sequence representations
+        # (slices each [B, L, D_s] tensor down to just the donor's hairpin span,
+        # which is spliced directly into the target's patch region elsewhere --
+        # assumes the two regions are equal length)
         donor_s_region = {
             k: v[:, donor_start:donor_end, :] 
             for k, v in donor_collected.s_blocks.items()
         }
         # Keep full z_blocks for pairwise patching
+        # (mask handles coordinate mapping back to the relevant donor span)
         donor_z_full = donor_collected.z_blocks
         
-        num_blocks = len(donor_s_region)
+        num_blocks = len(donor_s_region)  # 48 for the full folding trunk
         print(f"    Trunk blocks: {num_blocks}")
         
+        # donor_outputs (full structure prediction) no longer needed once its
+        # intermediate representations are extracted; free GPU memory before
+        # the many acceptor forward passes run below.
         del donor_outputs
         torch.cuda.empty_cache()
         
@@ -500,9 +607,15 @@ def run_experiment_on_dataset(
         # =====================================================================
         # SINGLE-BLOCK PATCHING EXPERIMENTS
         # =====================================================================
+        # Triple sweep: for every (patch_mode, mask_mode) combination, patch
+        # each of the 48 blocks individually (one model forward pass per
+        # block) to build a per-block causal profile for this case.
         for patch_mode in patch_modes:
             for mask_mode in patch_mask_modes:
                 # Skip redundant mask modes for sequence-only patching
+                # (pairwise_mask only affects z (pairwise) patching, so it has
+                # no effect when patch_mode == "sequence" -- run once using the
+                # first mask mode as a placeholder label)
                 if patch_mode == "sequence" and mask_mode != patch_mask_modes[0]:
                     continue
                 
@@ -540,12 +653,21 @@ def run_experiment_on_dataset(
                     torch.cuda.empty_cache()
                 
                 # Print progress for this mode
+                # Quick in-memory tally (rather than re-querying a DataFrame):
+                # filters case_results down to just this (patch_mode,
+                # mask_mode) combination's block sweep and divides by
+                # num_blocks -- relies on the inner loop above having appended
+                # exactly num_blocks matching entries for this combination.
                 success_rate = sum(r['hairpin_found'] for r in case_results if r['patch_mode'] == patch_mode and r['patch_mask_mode'] == mask_mode) / num_blocks
                 print(f"    {patch_mode}/{mask_mode}: {success_rate:.1%} success across {num_blocks} blocks")
         
         all_results.extend(case_results)
         
         # Flush results and regenerate plots every flush_every cases
+        # (long-running experiment -- many cases x 2-3 patch_modes x 48 blocks
+        # -- so periodic persistence avoids losing everything to a crash/OOM
+        # partway through, and lets progress be checked via the regenerated
+        # plots without waiting for the full run to finish)
         cases_completed = case_idx + 1
         if cases_completed % flush_every == 0 or cases_completed == len(df):
             print(f"\n  Flushing results ({cases_completed} cases completed)...")
@@ -554,6 +676,7 @@ def run_experiment_on_dataset(
             generate_basic_plots(interim_df, output_dir)
         
         # Clean up
+        # (this case's donor tensors, before moving on to the next case)
         del donor_collected, donor_s_region, donor_z_full
         torch.cuda.empty_cache()
     
@@ -566,6 +689,9 @@ def run_experiment_on_dataset(
     print(f"Results saved to {results_path}")
     print(f"Total experiments: {len(results_df)}")
     print(f"\nHairpin detection rate by block_idx:")
+    # hairpin_found is boolean, so groupby(...).mean() computes the fraction
+    # of True values per block -- each block's hairpin-formation success rate
+    # (this is the data behind the "blocks 0-10 matter most" finding).
     print(results_df.groupby("block_idx")["hairpin_found"].mean())
     print(f"\nHairpin detection rate by patch_mode:")
     print(results_df.groupby("patch_mode")["hairpin_found"].mean())
@@ -578,6 +704,7 @@ def run_experiment_on_dataset(
 # ============================================================================
 
 def main():
+    """CLI entry point: parse args and run the single-block patching experiment."""
     parser = argparse.ArgumentParser(
         description="Run single-block ESMFold patching experiments (refactored)"
     )

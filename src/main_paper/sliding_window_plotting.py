@@ -59,10 +59,16 @@ def plot_hairpin_retention(
         return None
     
     # Group by window_start and ablation_type, compute retention rate
+    # hairpin_found is boolean, so .mean() over each group is the FRACTION of
+    # runs where a hairpin was still found; *100 turns that into a %
+    # "retention rate" for each (window_start, ablation_type) combination.
     grouped = subset.groupby(['window_start', 'ablation_type'])['hairpin_found'].mean() * 100
+    # Collapse the groupby's multi-index back into flat
+    # window_start/ablation_type/hairpin_found(now a %) columns.
     grouped = grouped.reset_index()
     
     # Extract data for each ablation type
+    # Sort by window_start so the line plot below connects points in block order.
     pair2seq_data = grouped[grouped['ablation_type'] == 'pair2seq'].sort_values('window_start')
     seq2pair_data = grouped[grouped['ablation_type'] == 'seq2pair'].sort_values('window_start')
     
@@ -79,6 +85,10 @@ def plot_hairpin_retention(
                 linewidth=3, markersize=6, markevery=1, label='Ablate pair→seq', zorder=5)
     
     if len(blocks_seq2pair) > 0:
+        # NOTE: possible bug -- the comment says "Override block 0 to be 5%"
+        # but the actual override two lines below is commented out, so
+        # `block_0_idx` is computed and then never used; pct_seq2pair_adjusted
+        # ends up identical to pct_seq2pair. Left as found (not re-enabled).
         # Override block 0 to be 5%
         pct_seq2pair_adjusted = pct_seq2pair.copy()
         block_0_idx = np.where(blocks_seq2pair == 0)[0]
@@ -97,15 +107,21 @@ def plot_hairpin_retention(
     ax.spines['right'].set_visible(False)
     
     # Set axis limits
+    # Combine whichever of the two block-index arrays are non-empty (np.concatenate
+    # would error if either input array is empty) to get the full x-range to display.
     all_blocks = np.concatenate([blocks_pair2seq, blocks_seq2pair]) if len(blocks_pair2seq) > 0 and len(blocks_seq2pair) > 0 else (blocks_pair2seq if len(blocks_pair2seq) > 0 else blocks_seq2pair)
     if len(all_blocks) > 0:
         ax.set_xlim(all_blocks.min(), all_blocks.max())
     ax.set_ylim(0, 100)
     
     # Force integer x-ticks
+    # window_start is a discrete block index, so fractional tick labels would be misleading.
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     
     # Legend (1.5x the base legend_size)
+    # The "legend_size" parameter is not used directly -- the rendered legend
+    # font is 1.45x that value; bbox_to_anchor nudges the legend box slightly
+    # right/below the default 'lower right' anchor point.
     ax.legend(loc='lower right', fontsize=legend_size * 1.45, frameon=True, bbox_to_anchor=(1.08,0.00))
 
     
@@ -146,6 +162,7 @@ def generate_ablation_plots(df: pd.DataFrame, output_dir: str):
     window_sizes = sorted(df['window_size'].unique())
     patch_modes = df['patch_mode'].unique() if 'patch_mode' in df.columns else ['sequence']
 
+    # One figure per (window_size, patch_mode) combination present in the data.
     for ws in window_sizes:
         for pm in patch_modes:
             output_path = os.path.join(output_dir, f'hairpin_retention_w{ws}_{pm}.png')
@@ -153,11 +170,13 @@ def generate_ablation_plots(df: pd.DataFrame, output_dir: str):
 
 
 def main():
+    """CLI entry point: load an ablation results CSV and save a single hairpin-retention figure."""
     parser = argparse.ArgumentParser(description='Plot hairpin retention for ablation experiments')
     parser.add_argument('--csv', type=str, required=True,
                         help='Path to ablation_results.csv')
     parser.add_argument('--output', type=str, default='hairpin_retention.png',
                         help='Output path for figure')
+    # NOTE: possible bug -- actual default is 15, but help text says "(default: 10)".
     parser.add_argument('--window-size', type=int, default=15,
                         help='Window size to filter (default: 10)')
     parser.add_argument('--patch-mode', type=str, default='sequence',

@@ -27,6 +27,9 @@ def load_results(results_path: str) -> pd.DataFrame:
 
 def create_method_label(row: pd.Series) -> str:
     """Create a readable label for each patching method."""
+    # Mirrors the patch_module/patch_mode/patch_mask_mode column values
+    # produced by module_patching.py's run_experiment_on_dataset(); "\n"
+    # splits each label onto two lines so bar/tick labels stay compact.
     if row.get("patch_mode") == "input_intervention":
         return "Input\nIntervention"
     
@@ -53,20 +56,30 @@ def create_method_label(row: pd.Series) -> str:
 
 def plot_success_rates(df: pd.DataFrame, output_dir: Path):
     """Plot hairpin detection success rates for all methods."""
-    df = df.copy()
+    df = df.copy()  # avoid mutating the caller's DataFrame with the new "method" column
     df["method"] = df.apply(create_method_label, axis=1)
     
+    # .agg with a dict-of-lists produces a hierarchical (MultiIndex) column
+    # DataFrame (method, then (hairpin_found, mean/sum/count)); the explicit
+    # .columns assignment below flattens/renames it to plain column names.
+    # mean() of the boolean hairpin_found column = fraction True = success rate.
     success_rates = df.groupby("method").agg({
         "hairpin_found": ["mean", "sum", "count"]
-    }).reset_index()
+    }).reset_index()  # reset_index() turns the "method" groupby key back into a normal column
     success_rates.columns = ["method", "success_rate", "n_success", "n_total"]
+    # ascending=True because barh draws its first row at the bottom, so an
+    # ascending sort puts the highest success rate at the top of the chart.
     success_rates = success_rates.sort_values("success_rate", ascending=True)
     
     fig, ax = plt.subplots(figsize=(12, 6))
     
+    # Sample len(success_rates) colors from viridis, restricted to the
+    # 0.2-0.8 range of the colormap to avoid its very dark/very bright ends.
     colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(success_rates)))
     bars = ax.barh(success_rates["method"], success_rates["success_rate"], color=colors)
     
+    # Annotate each bar with "xx.x% (n_success/n_total)" just past its right
+    # edge, vertically centered on the bar.
     for bar, (_, row) in zip(bars, success_rates.iterrows()):
         width = bar.get_width()
         ax.text(width + 0.02, bar.get_y() + bar.get_height()/2,
@@ -75,8 +88,10 @@ def plot_success_rates(df: pd.DataFrame, output_dir: Path):
     
     ax.set_xlabel("Hairpin Detection Rate", fontsize=12)
     ax.set_title("Hairpin Transfer Success Rate by Patching Method", fontsize=14)
+    # Axis extends past 1.0 (100%) so the text labels drawn just past each
+    # bar's end (above) have room and don't get clipped.
     ax.set_xlim(0, 1.15)
-    ax.axvline(x=0.5, color='gray', linestyle='--', alpha=0.5)
+    ax.axvline(x=0.5, color='gray', linestyle='--', alpha=0.5)  # 50% reference line
     
     plt.tight_layout()
     plt.savefig(output_dir / "success_rates.png", dpi=150, bbox_inches='tight')
@@ -92,8 +107,11 @@ def plot_success_rates_grouped(df: pd.DataFrame, output_dir: Path):
     df["method"] = df.apply(create_method_label, axis=1)
     
     def get_module_group(row):
+        """Assign the high-level module-group label ("Baseline"/"Encoder"/"Trunk"/"Structure Module") used to color and order bars."""
         if row.get("patch_mode") == "input_intervention":
             return "Baseline"
+        # e.g. "structure_module" -> "Structure Module"; must match the
+        # group_order / group_colors keys defined below exactly.
         return row.get("patch_module", "unknown").replace("_", " ").title()
     
     df["module_group"] = df.apply(get_module_group, axis=1)
@@ -101,12 +119,17 @@ def plot_success_rates_grouped(df: pd.DataFrame, output_dir: Path):
     success_by_method = df.groupby(["module_group", "method"])["hairpin_found"].agg(["mean", "count"]).reset_index()
     success_by_method.columns = ["module_group", "method", "success_rate", "n"]
     
+    # pd.Categorical with ordered=True + this explicit categories list makes
+    # sort_values below follow this logical order (Baseline -> Encoder ->
+    # Trunk -> Structure Module) instead of alphabetical order.
     group_order = ["Baseline", "Encoder", "Trunk", "Structure Module"]
     success_by_method["module_group"] = pd.Categorical(
         success_by_method["module_group"], 
         categories=group_order, 
         ordered=True
     )
+    # Sort by group first (per the custom order above), then by success rate
+    # within each group.
     success_by_method = success_by_method.sort_values(["module_group", "success_rate"])
     
     fig, ax = plt.subplots(figsize=(12, 8))
@@ -118,8 +141,13 @@ def plot_success_rates_grouped(df: pd.DataFrame, output_dir: Path):
         "Structure Module": "#9b59b6"
     }
     
+    # Fallback gray for any group not in the mapping above (shouldn't normally
+    # occur given get_module_group's fixed set of outputs).
     colors = [group_colors.get(g, "#95a5a6") for g in success_by_method["module_group"]]
     
+    # Plot bars at integer positions (rather than passing "method" strings
+    # directly to barh) so the exact row order from the sort above is
+    # preserved; yticklabels are then set manually to show the real labels.
     bars = ax.barh(range(len(success_by_method)), success_by_method["success_rate"], color=colors)
     ax.set_yticks(range(len(success_by_method)))
     ax.set_yticklabels(success_by_method["method"])
@@ -130,13 +158,18 @@ def plot_success_rates_grouped(df: pd.DataFrame, output_dir: Path):
                 f'{width:.1%} (n={int(row["n"])})',
                 va='center', fontsize=9)
     
+    # Legend handles are built manually (rather than relying on ax.legend()
+    # auto-detecting labeled artists) because barh() above was called once
+    # with a per-bar color list, not once per group with its own label; the
+    # `if g in df["module_group"].values` filter skips any group with zero
+    # bars in this particular results file.
     from matplotlib.patches import Patch
     legend_elements = [Patch(facecolor=c, label=g) for g, c in group_colors.items() if g in df["module_group"].values]
     ax.legend(handles=legend_elements, loc='lower right', fontsize=10)
     
     ax.set_xlabel("Hairpin Detection Rate", fontsize=12)
     ax.set_title("Hairpin Transfer Success Rate by Patching Method", fontsize=14)
-    ax.set_xlim(0, 1.2)
+    ax.set_xlim(0, 1.2)  # room for the "xx.x% (n=...)" labels past each bar's end
     ax.axvline(x=0.5, color='gray', linestyle='--', alpha=0.5)
     
     plt.tight_layout()
@@ -148,6 +181,8 @@ def plot_success_rates_grouped(df: pd.DataFrame, output_dir: Path):
 
 def plot_helix_degradation(df: pd.DataFrame, output_dir: Path):
     """Plot alpha helix content changes for successful vs unsuccessful patches."""
+    # helix_change is an optional column -- only present if the experiment was
+    # run with compute_helix=True -- so skip gracefully rather than crashing.
     if "helix_change" not in df.columns or df["helix_change"].isna().all():
         print("No helix change data available, skipping helix degradation plot")
         return None
@@ -156,6 +191,7 @@ def plot_helix_degradation(df: pd.DataFrame, output_dir: Path):
     df["method"] = df.apply(create_method_label, axis=1)
     df["outcome"] = df["hairpin_found"].map({True: "Success", False: "Failure"})
     
+    # Drop rows without a computed helix_change (e.g. cases where DSSP failed).
     df_helix = df[df["helix_change"].notna()].copy()
     
     if len(df_helix) == 0:
@@ -168,6 +204,8 @@ def plot_helix_degradation(df: pd.DataFrame, output_dir: Path):
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     
     ax1 = axes[0]
+    # Order methods along the x-axis by descending hairpin success rate
+    # (rather than alphabetically) so the plot reads "best method first".
     methods_order = df_helix.groupby("method")["hairpin_found"].mean().sort_values(ascending=False).index.tolist()
     
     sns.boxplot(
@@ -177,7 +215,7 @@ def plot_helix_degradation(df: pd.DataFrame, output_dir: Path):
         hue="outcome",
         order=methods_order,
         ax=ax1,
-        palette={"Success": "#2ecc71", "Failure": "#e74c3c"}
+        palette={"Success": "#2ecc71", "Failure": "#e74c3c"}  # green=success, red=failure (used throughout this file)
     )
     ax1.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
     ax1.set_xlabel("")
@@ -188,10 +226,14 @@ def plot_helix_degradation(df: pd.DataFrame, output_dir: Path):
     
     ax2 = axes[1]
     
+    # Collapse across all methods to look at the overall success/failure
+    # helix-change distributions, independent of which method was used.
     overall_by_outcome = df_helix.groupby("outcome")["helix_change"].agg(["mean", "std", "count"])
     
     x = [0, 1]
     means = [overall_by_outcome.loc["Failure", "mean"], overall_by_outcome.loc["Success", "mean"]]
+    # std (not standard error): error bars show spread across cases within
+    # each outcome group, not confidence in the mean estimate.
     stds = [overall_by_outcome.loc["Failure", "std"], overall_by_outcome.loc["Success", "std"]]
     ns = [overall_by_outcome.loc["Failure", "count"], overall_by_outcome.loc["Success", "count"]]
     colors = ["#e74c3c", "#2ecc71"]
@@ -205,6 +247,9 @@ def plot_helix_degradation(df: pd.DataFrame, output_dir: Path):
     
     for i, (bar, n) in enumerate(zip(bars, ns)):
         height = bar.get_height()
+        # Position the "n=..." label above the bar's own error-bar extent
+        # (height + stds[i]), plus a small fixed 0.5 percentage-point padding
+        # so it doesn't overlap the error bar cap.
         ax2.text(bar.get_x() + bar.get_width()/2, height + stds[i] + 0.5,
                 f'n={int(n)}', ha='center', fontsize=10)
     
@@ -229,11 +274,15 @@ def plot_helix_by_method(df: pd.DataFrame, output_dir: Path):
     if len(df_helix) == 0:
         return
     
+    # Same multi-level agg -> flatten-columns pattern as the other plot
+    # functions above (groupby.agg with a dict produces MultiIndex columns,
+    # renamed here to plain names).
     stats = df_helix.groupby(["method", "hairpin_found"]).agg({
         "helix_change": ["mean", "std", "count"]
     }).reset_index()
     stats.columns = ["method", "hairpin_found", "mean", "std", "n"]
     
+    # Split into two per-method-indexed tables for convenient .loc lookups below.
     success_stats = stats[stats["hairpin_found"] == True].set_index("method")
     failure_stats = stats[stats["hairpin_found"] == False].set_index("method")
     
@@ -241,9 +290,18 @@ def plot_helix_by_method(df: pd.DataFrame, output_dir: Path):
     
     fig, ax = plt.subplots(figsize=(12, 6))
     
+    # Classic grouped/paired bar chart setup: integer x position per method,
+    # each method gets a failure bar and a success bar offset by +/- width/2.
+    # width=0.35 (< 0.5) keeps each method's pair of bars from overlapping
+    # into the neighboring method's bars.
     x = np.arange(len(methods))
     width = 0.35
     
+    # NOTE: possible bug -- methods with zero successful (or zero failed)
+    # cases fall back to a mean/std of 0 here rather than being omitted or
+    # marked as "no data". A 0-height bar is visually indistinguishable from
+    # "mean helix change of exactly 0%", which could be misread as a real
+    # measurement rather than an absence of data for that outcome.
     success_means = [success_stats.loc[m, "mean"] if m in success_stats.index else 0 for m in methods]
     success_stds = [success_stats.loc[m, "std"] if m in success_stats.index else 0 for m in methods]
     failure_means = [failure_stats.loc[m, "mean"] if m in failure_stats.index else 0 for m in methods]
@@ -277,6 +335,7 @@ def plot_plddt_comparison(df: pd.DataFrame, output_dir: Path):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
     ax1 = axes[0]
+    # Same "best method first" ordering convention as plot_helix_degradation above.
     methods_order = df.groupby("method")["hairpin_found"].mean().sort_values(ascending=False).index.tolist()
     
     sns.boxplot(
@@ -322,6 +381,8 @@ def plot_summary_table(df: pd.DataFrame, output_dir: Path):
     df = df.copy()
     df["method"] = df.apply(create_method_label, axis=1)
     
+    # Multi-column agg (see plot_success_rates above for the general pattern),
+    # covering three metrics at once; flattened to plain names just below.
     summary = df.groupby("method").agg({
         "hairpin_found": ["mean", "sum", "count"],
         "mean_plddt": ["mean", "std"],
@@ -334,6 +395,8 @@ def plot_summary_table(df: pd.DataFrame, output_dir: Path):
         "patch_plddt_avg", "patch_plddt_std"
     ]
     
+    # helix_change is optional (see plot_helix_degradation); only add these
+    # columns to the summary if the experiment actually computed helix content.
     if "helix_change" in df.columns and not df["helix_change"].isna().all():
         helix_stats = df.groupby("method")["helix_change"].agg(["mean", "std"])
         helix_stats.columns = ["helix_change_avg", "helix_change_std"]
@@ -354,6 +417,7 @@ def plot_summary_table(df: pd.DataFrame, output_dir: Path):
 
 
 def main():
+    """CLI entry point: load a results parquet file and generate all summary plots."""
     parser = argparse.ArgumentParser(description="Plot ESMFold patching experiment results")
     parser.add_argument(
         "--results", type=str, required=True,

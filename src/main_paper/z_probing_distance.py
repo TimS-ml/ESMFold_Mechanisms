@@ -28,14 +28,15 @@ from transformers import EsmForProteinFolding, AutoTokenizer
 from transformers.models.esm.modeling_esmfold import EsmForProteinFoldingOutput
 
 from src.utils.representation_utils import CollectedRepresentations, TrunkHooks
+from src.utils.model_utils import load_esmfold  # shared ESMFold loader (handles precision/device setup)
 
 
 # ============================================================================
 # CONSTANTS
 # ============================================================================
 
-NUM_BLOCKS = 48
-AA_LIST = list("ACDEFGHIKLMNPQRSTVWY")
+NUM_BLOCKS = 48  # ESMFold's folding trunk has 48 sequence/pairwise update blocks
+AA_LIST = list("ACDEFGHIKLMNPQRSTVWY")  # the 20 canonical amino acids (no ambiguity codes like X/B/Z/U)
 AA_TO_IDX = {aa: i for i, aa in enumerate(AA_LIST)}
 
 
@@ -57,7 +58,12 @@ class DistanceProbe:
 
     def get_gradient_direction(self) -> np.ndarray:
         """Get normalized direction that DECREASES predicted distance."""
+        # Since pred = z . w + b, moving z along +w increases the prediction,
+        # so -w is the direction of steepest decrease. This is the direction
+        # used by contact_steering.py to push z toward shorter predicted
+        # CA-CA distance (i.e. "encourage contact").
         direction = -self.weights
+        # +1e-8 avoids division by zero if the weight vector is ~0.
         return direction / (np.linalg.norm(direction) + 1e-8)
 
     def get_steering_vector(self, current_z: np.ndarray, target_distance: float) -> np.ndarray:
@@ -72,8 +78,14 @@ class DistanceProbe:
 
         w_norm_sq = np.dot(self.weights, self.weights)
         if w_norm_sq < 1e-8:
+            # Degenerate probe (near-zero weight vector): no direction to steer along.
             return np.zeros_like(self.weights)
 
+        # Minimal-norm perturbation dz that changes the linear prediction by
+        # exactly delta_distance: solves dz . w = delta_distance for the dz
+        # proportional to w (least-squares solution for a single linear
+        # constraint). This is the "steering vector" applied to z activations
+        # in contact_steering.py.
         return delta_distance * self.weights / w_norm_sq
 
 
@@ -92,13 +104,21 @@ def run_and_collect_z(
     """
     collector = CollectedRepresentations()
     trunk_hooks = TrunkHooks(model.trunk, collector)
+    # Only collect z (pairwise); s isn't needed for distance probing.
     trunk_hooks.register(collect_s=False, collect_z=True)
     
     try:
         with torch.no_grad():
+            # add_special_tokens=False: ESMFold expects raw residue tokens only.
             inputs = tokenizer(sequence, return_tensors='pt', add_special_tokens=False).to(device)
+            # num_recycles=0: single trunk pass (no structure-module recycling),
+            # so the hook-captured z_blocks correspond to one well-defined forward pass.
             outputs = model(**inputs, num_recycles=0)
     finally:
+        # Ensures hooks are always removed, even if the forward pass raises
+        # (e.g. OOM) -- important since this is called once per sequence over
+        # a loop of potentially thousands of proteins, and a leaked hook would
+        # persist onto the model for every subsequent call.
         trunk_hooks.remove()
     
     return outputs, collector
@@ -106,9 +126,11 @@ def run_and_collect_z(
 
 def compute_ca_distances(positions: torch.Tensor) -> torch.Tensor:
     """Compute CA-CA distance matrix."""
-    CA_IDX = 1
+    CA_IDX = 1  # atom14 backbone ordering: N=0, CA=1, C=2, O=3, ...
     ca_coords = positions[:, CA_IDX, :]
+    # Broadcast [L, 1, 3] - [1, L, 3] -> [L, L, 3] pairwise difference vectors.
     diff = ca_coords.unsqueeze(0) - ca_coords.unsqueeze(1)
+    # +1e-8 avoids sqrt(0) (NaN gradient) at the i==j diagonal (self-distance).
     return torch.sqrt((diff ** 2).sum(-1) + 1e-8)
 
 
@@ -135,6 +157,9 @@ class OnlineRidgeAccumulator:
     n_samples: int = 0
     
     def __post_init__(self):
+        # Dataclass field defaults can't reference other instance fields (e.g.
+        # `dim`), so the zero-initialized arrays are allocated here instead,
+        # after `dim` is already set.
         self.XtX = np.zeros((self.dim, self.dim), dtype=np.float64)
         self.Xty = np.zeros(self.dim, dtype=np.float64)
     
@@ -146,9 +171,16 @@ class OnlineRidgeAccumulator:
             X: Feature matrix [batch_size, dim]
             y: Target values [batch_size]
         """
+        # Upcast to float64: the running Gram matrix accumulates over many
+        # thousands of samples, so float64 reduces numerical error relative to
+        # the (likely float32) source activations.
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64)
         
+        # Sufficient-statistics trick: incrementally summing X.T@X and X.T@y
+        # per batch is mathematically identical to computing them once over
+        # all concatenated data, but avoids ever holding the full [N, dim]
+        # dataset in memory.
         self.XtX += X.T @ X
         self.Xty += X.T @ y
         self.yty += np.dot(y, y)
@@ -169,7 +201,13 @@ class OnlineRidgeAccumulator:
             raise ValueError(f"No samples for block {self.block_idx}")
         
         # Solve (X'X + αI) w = X'y
+        # Adding alpha to the diagonal (a) keeps the matrix well-conditioned/
+        # invertible even when dim is large relative to n_samples or features
+        # are collinear, and (b) is the standard L2 (Ridge) penalty, equivalent
+        # to minimizing ||Xw - y||^2 + alpha*||w||^2.
         regularized = self.XtX + alpha * np.eye(self.dim)
+        # np.linalg.solve is more numerically stable (and faster) than
+        # explicitly inverting `regularized` and multiplying.
         weights = np.linalg.solve(regularized, self.Xty)
         
         # Bias: for Ridge without centering, bias = 0
@@ -181,9 +219,15 @@ class OnlineRidgeAccumulator:
         # R² = 1 - SS_res / SS_tot
         # SS_res = y'y - 2*w'X'y + w'X'X*w
         # SS_tot = y'y - n * y_mean²
+        # (expanding the residual/total sums of squares this way lets them be
+        # computed purely from the accumulated statistics, without ever
+        # materializing the raw X, y arrays -- consistent with the online/
+        # streaming design of this accumulator)
         y_mean = self.y_sum / self.n_samples
         ss_tot = self.yty - self.n_samples * y_mean ** 2
         ss_res = self.yty - 2 * np.dot(weights, self.Xty) + weights @ self.XtX @ weights
+        # Guard against zero-variance y (ss_tot == 0), which would make R²
+        # undefined; falls back to 0.0 in that degenerate case.
         r2_train = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
         
         return DistanceProbe(
@@ -232,11 +276,16 @@ def train_probes_online(
     proteins_processed = 0
     total_samples = 0
     
+    # Proteins are processed one at a time (not batched) since ESMFold forward
+    # passes for variable-length sequences aren't easily batched together here.
     for seq in tqdm(sequences, desc="Training probes (online)"):
         # Skip invalid sequences
+        # (sequences containing residue codes outside the fixed 20-letter
+        # AA_TO_IDX vocabulary, e.g. ambiguity codes like 'X')
         if not all(aa in AA_TO_IDX for aa in seq):
             continue
         if len(seq) < 10:
+            # Minimum length so there are enough residue pairs to be worth sampling.
             continue
         
         L = len(seq)
@@ -250,18 +299,28 @@ def train_probes_online(
         # Initialize accumulators on first protein
         if dim is None:
             # Get dimension from first block's z
+            # (arbitrary block -- all blocks share the same z feature dimension)
             first_z = next(iter(collector.z_blocks.values()))
             dim = first_z.shape[-1]
             print(f"Z dimension: {dim}")
+            # One independent accumulator (and eventually one probe) per trunk block.
             accumulators = {b: OnlineRidgeAccumulator(dim=dim, block_idx=b) for b in range(NUM_BLOCKS)}
         
         # Compute CA distances
+        # outputs.positions shape: [structure-module iterations, batch, L, 14, 3];
+        # [-1] takes the final refined coordinates, [0] takes the single batch item.
         final_positions = outputs.positions[-1, 0]
         distances = compute_ca_distances(final_positions)
         
         # Sample pairs (all pairs where i != j)
+        # (excludes the diagonal: self-distance is always 0 and uninformative;
+        # both (i, j) and (j, i) are included since z[i, j] and z[j, i] are
+        # generally different feature vectors despite the same physical distance)
         all_pairs = [(i, j) for i in range(L) for j in range(L) if i != j]
         
+        # Subsample a fixed number of pairs per protein (without replacement) to
+        # bound compute/memory cost for large proteins; smaller proteins just
+        # use every available pair.
         if len(all_pairs) > n_pairs_per_protein:
             sampled_indices = np.random.choice(len(all_pairs), n_pairs_per_protein, replace=False)
             sampled_pairs = [all_pairs[k] for k in sampled_indices]
@@ -270,9 +329,11 @@ def train_probes_online(
         
         # Update accumulators for each block
         for block_idx, z in collector.z_blocks.items():
+            # [0] drops the batch dim (always size 1 here, single sequence per forward pass)
             z_np = z[0].cpu().numpy()  # [L, L, dim]
             
             # Gather batch for this protein
+            # (distances[i, j].item() converts a 0-dim tensor to a plain float)
             X_batch = np.array([z_np[i, j] for i, j in sampled_pairs], dtype=np.float64)
             y_batch = np.array([distances[i, j].item() for i, j in sampled_pairs], dtype=np.float64)
             
@@ -282,6 +343,9 @@ def train_probes_online(
         total_samples += len(sampled_pairs)
         
         # Clean up
+        # (eagerly free GPU memory; this loop may process thousands of
+        # proteins, so unfreed per-block z tensors/positions would otherwise
+        # accumulate and fragment VRAM over a long run)
         del outputs, collector
         torch.cuda.empty_cache()
         
@@ -295,6 +359,8 @@ def train_probes_online(
     probes = {}
     for block in tqdm(range(NUM_BLOCKS), desc="Solving probes"):
         if accumulators[block].n_samples < 100:
+            # Minimum sample count below which fitting a probe for this block
+            # would be too unreliable/underdetermined to report.
             print(f"Block {block}: insufficient samples ({accumulators[block].n_samples})")
             continue
         
@@ -302,6 +368,8 @@ def train_probes_online(
         probes[block] = probe
         
         if block % 8 == 0:
+            # Log only every 8th block's progress to avoid flooding stdout
+            # across all 48 blocks.
             tqdm.write(f"  Block {block}: R² = {probe.r2_train:.4f}, n = {accumulators[block].n_samples}")
     
     return probes
@@ -324,6 +392,11 @@ def evaluate_probes_online(
     """
     # Accumulators for evaluation metrics
     # We need: sum of squared residuals, sum of squared total, n
+    # NOTE: possible bug -- ss_res, ss_tot_acc, and y_sq_sum are initialized
+    # here but never updated or read anywhere else in this function (grep
+    # confirms no other reference). The R² computation further below instead
+    # recomputes equivalent quantities from sum_y2/sum_yyhat/sum_yhat2/sum_y.
+    # These three dicts appear to be dead/vestigial.
     ss_res = {b: 0.0 for b in probes.keys()}
     ss_tot_acc = {b: 0.0 for b in probes.keys()}  # accumulate (y - y_mean)² later
     y_sum = {b: 0.0 for b in probes.keys()}
@@ -331,6 +404,7 @@ def evaluate_probes_online(
     n_samples = {b: 0 for b in probes.keys()}
     
     # For correlation: need sum(y), sum(y_pred), sum(y²), sum(y_pred²), sum(y*y_pred)
+    # (this set of accumulators is the one actually used below)
     sum_y = {b: 0.0 for b in probes.keys()}
     sum_yhat = {b: 0.0 for b in probes.keys()}
     sum_y2 = {b: 0.0 for b in probes.keys()}
@@ -340,6 +414,8 @@ def evaluate_probes_online(
     
     proteins_processed = 0
     
+    # Same per-protein processing pattern as train_probes_online above
+    # (skip invalid/too-short sequences, skip proteins that error out).
     for seq in tqdm(sequences, desc="Evaluating probes"):
         if not all(aa in AA_TO_IDX for aa in seq):
             continue
@@ -364,6 +440,7 @@ def evaluate_probes_online(
         else:
             sampled_pairs = all_pairs
         
+        # Evaluate each block's already-trained probe on this protein's sampled pairs.
         for block_idx in probes.keys():
             z_np = collector.z_blocks[block_idx][0].cpu().numpy()
             
@@ -407,13 +484,17 @@ def evaluate_probes_online(
         y_mean = sum_y[block] / n
         ss_res_val = sum_y2[block] - 2 * sum_yyhat[block] + sum_yhat2[block]
         ss_tot_val = sum_y2[block] - n * y_mean ** 2
+        # Falls back to 0.0 if y has zero variance in this block (ss_tot_val == 0).
         r2 = 1 - ss_res_val / ss_tot_val if ss_tot_val > 0 else 0.0
         
         # Correlation using the formula:
         # r = (n*sum(xy) - sum(x)*sum(y)) / sqrt((n*sum(x²) - sum(x)²) * (n*sum(y²) - sum(y)²))
+        # (standard raw-score Pearson correlation, computable from sums alone --
+        # same sufficient-statistics approach as the R² above)
         numer = n * sum_yyhat[block] - sum_y[block] * sum_yhat[block]
         denom1 = n * sum_y2[block] - sum_y[block] ** 2
         denom2 = n * sum_yhat2[block] - sum_yhat[block] ** 2
+        # Guards against zero variance in y or y_pred for this block.
         corr = numer / np.sqrt(denom1 * denom2) if denom1 > 0 and denom2 > 0 else 0.0
         
         results.append({
@@ -422,6 +503,8 @@ def evaluate_probes_online(
             'mae': mae,
             'correlation': corr,
             'n_samples': n,
+            # Training-set R² (from when the probe was fit) alongside this
+            # block's test-set r2 computed just above, for train-vs-test comparison.
             'r2_train': probes[block].r2_train,
         })
     
@@ -430,6 +513,8 @@ def evaluate_probes_online(
 
 def save_probes(probes: Dict[int, DistanceProbe], path: str):
     """Save probes to disk."""
+    # Serialize as plain dicts/arrays (rather than pickling DistanceProbe
+    # instances directly) for a storage format independent of the dataclass definition.
     data = {
         block: {
             'weights': p.weights,
@@ -445,6 +530,9 @@ def save_probes(probes: Dict[int, DistanceProbe], path: str):
 
 def load_probes(path: str) -> Dict[int, DistanceProbe]:
     """Load probes from disk."""
+    # weights_only=False is required: the saved payload is plain Python
+    # dicts/numpy arrays, not just tensor state_dicts, and newer PyTorch
+    # defaults torch.load to weights_only=True (which would reject this).
     data = torch.load(path, weights_only=False)
     probes = {
         block: DistanceProbe(**pdata)
@@ -460,6 +548,8 @@ def load_probes(path: str) -> Dict[int, DistanceProbe]:
 
 def plot_probe_results(eval_df: pd.DataFrame, output_dir: str, prefix: str = ""):
     """Plot probe evaluation results."""
+    # Three side-by-side panels (R², MAE, correlation vs. block) to see how
+    # distance-predictiveness of z evolves across the trunk's 48 blocks.
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     
     # R² by block
@@ -501,6 +591,7 @@ def plot_probe_results(eval_df: pd.DataFrame, output_dir: str, prefix: str = "")
 # ============================================================================
 
 def parse_args():
+    """Parse command-line arguments for the distance probing script."""
     parser = argparse.ArgumentParser(description="Train distance probes on ESMFold z representations")
     parser.add_argument('--probing_dataset', type=str, default='data/fixed.csv',
                         help='Path to probing dataset CSV with train/test splits')
@@ -522,6 +613,8 @@ def parse_args():
 
 
 def main():
+    """Entry point: load data, train per-block Ridge distance probes, evaluate
+    them on held-out sequences, save probes/metrics, and generate plots."""
     args = parse_args()
     
     # Setup
@@ -533,9 +626,7 @@ def main():
     print(f"Using device: {device}")
     
     # Load model
-    print("\nLoading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    model, tokenizer = load_esmfold(device)  # shared loader; picks precision automatically (see src/utils/model_utils.py)
     
     # Load dataset
     print(f"\nLoading dataset from {args.probing_dataset}...")
@@ -544,6 +635,8 @@ def main():
     # Show composition
     if 'split' in df.columns and 'label' in df.columns:
         print("\nDataset composition:")
+        # Cross-tab of split x label counts (rows=split, columns=label) for a
+        # quick sanity check on class/split balance.
         print(df.groupby(['split', 'label']).size().unstack(fill_value=0))
     
     # Get train/test sequences
@@ -552,6 +645,7 @@ def main():
         test_df = df[df['split'] == 'test']
     else:
         # Random split if no split column
+        # (80/20 split; test_df is the complement of the sampled train rows)
         train_df = df.sample(frac=0.8, random_state=args.seed)
         test_df = df.drop(train_df.index)
     
@@ -559,6 +653,8 @@ def main():
     test_seqs = test_df['sequence'].tolist()
     
     # Filter valid sequences
+    # (redundant with the same check inside train/evaluate_probes_online, but
+    # done here too so the printed sequence counts below already reflect the usable set)
     train_seqs = [s for s in train_seqs if all(aa in AA_TO_IDX for aa in s)]
     test_seqs = [s for s in test_seqs if all(aa in AA_TO_IDX for aa in s)]
     
@@ -634,6 +730,8 @@ def main():
         fig, ax = plt.subplots(figsize=(10, 5))
         blocks = test_eval_df['block'].values
         width = 0.35
+        # Side-by-side grouped bars: shift train bars left and test bars right
+        # by half the bar width so they sit adjacent (not overlapping) at each block.
         ax.bar(blocks - width/2, test_eval_df['r2_train'], width, label='Train', color='steelblue', alpha=0.7)
         ax.bar(blocks + width/2, test_eval_df['r2'], width, label='Test', color='coral', alpha=0.7)
         ax.set_xlabel('Block', fontsize=12)
@@ -651,6 +749,7 @@ def main():
     print("SUMMARY")
     print("="*60)
     
+    # Block with the single highest test-set R² (peak distance-predictiveness).
     best_block = test_eval_df.loc[test_eval_df['r2'].idxmax()]
     print(f"\nBest block: {int(best_block['block'])}")
     print(f"  Test R²: {best_block['r2']:.4f}")

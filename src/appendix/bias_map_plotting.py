@@ -26,13 +26,16 @@ from transformers.models.esm.modeling_esmfold import EsmFoldingTrunk
 from transformers.utils import ContextManagers
 import pandas as pd
 
+# Shared helper: loads facebook/esmfold_v1 + tokenizer with auto-selected precision (see model_utils.py).
+from src.utils.model_utils import load_esmfold
+
 
 # =============================================================================
 # Configuration
 # =============================================================================
-BLOCKS = [0, 4, 8, 12, 16, 20, 24, 28, 30, 32, 36, 40, 44, 47]
-HEAD_DETAIL_BLOCK = 32
-NUM_HEADS = 8
+BLOCKS = [0, 4, 8, 12, 16, 20, 24, 28, 30, 32, 36, 40, 44, 47]  # sampled across all 48 trunk blocks
+HEAD_DETAIL_BLOCK = 32  # block to additionally break down per-attention-head (rather than head-averaged)
+NUM_HEADS = 8  # number of attention heads in ESMFold's sequence attention
 CONTACT_THRESHOLD = 8.0  # Angstroms
 CONTACT_LINEWIDTH = 4  # doubled from default ~2
 OUTPUT_DIR = "bias_maps"
@@ -50,6 +53,11 @@ FIGSIZE = (8, 7)
 # =============================================================================
 def make_collecting_trunk_forward(blocks_to_collect, detail_block, collected):
     """Return a replacement trunk.forward that stores bias tensors."""
+    # NOTE: possible bug -- `detail_block` is accepted but never referenced anywhere
+    # in trunk_forward/trunk_iter below; per-head data for it works anyway because
+    # the caller already includes HEAD_DETAIL_BLOCK in `blocks_to_collect`
+    # (blocks_needed = set(BLOCKS), and HEAD_DETAIL_BLOCK is a member of BLOCKS), so
+    # its full per-head bias tensor gets collected like any other requested block.
 
     def trunk_forward(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
         device = seq_feats.device
@@ -72,8 +80,13 @@ def make_collecting_trunk_forward(blocks_to_collect, detail_block, collected):
         s_s, s_z = s_s_0, s_z_0
         recycle_s = torch.zeros_like(s_s)
         recycle_z = torch.zeros_like(s_z)
+        # Discretized CA-CA distance-bin indices fed back into the trunk on the next
+        # recycle; starts at bin 0 (no prior structure) before the first pass.
         recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
 
+        # Standard ESMFold/AlphaFold recycling loop: re-run the trunk, feeding back
+        # the previous iteration's normalized s/z plus predicted distance bins.
+        # main() below calls this with num_recycles=0 -> a single, non-recycled pass.
         for recycle_idx in range(no_recycles):
             with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
                 recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
@@ -85,6 +98,8 @@ def make_collecting_trunk_forward(blocks_to_collect, detail_block, collected):
                     true_aa, mask.float(),
                 )
                 recycle_s, recycle_z = s_s, s_z
+                # Bin edges 3.375-21.375 Å define the discretization range for
+                # predicted CA-CA distances (self.recycle_bins = number of bins).
                 recycle_bins = EsmFoldingTrunk.distogram(
                     structure["positions"][-1][:, :, :3], 3.375, 21.375, self.recycle_bins,
                 )
@@ -102,13 +117,18 @@ def plot_bias_with_contacts(bias_2d, contacts, title, save_path, font_scale=1.0)
     """Plot a single bias heatmap with contact contour overlay."""
     fig, ax = plt.subplots(figsize=FIGSIZE)
 
+    # Robust color-scale limit: 98th percentile of |bias| rather than the raw max,
+    # so a few outlier values don't wash out the rest of the heatmap.
     vmax = np.percentile(np.abs(bias_2d), 98)
     if vmax < 1e-6:
         vmax = 1.0  # avoid degenerate color scale for near-zero biases
 
     im = ax.imshow(bias_2d, cmap="RdBu_r", aspect="auto", vmin=-vmax, vmax=vmax)
+    # Contour at level 0.5 traces the boundary of the binary (0/1) contact map.
     ax.contour(contacts, levels=[0.5], colors="lime", linewidths=CONTACT_LINEWIDTH)
 
+    # font_scale uniformly scales all text sizes -- lets the same function produce
+    # both normal-sized figures and enlarged "clean" versions (e.g. for slides).
     ax.set_xlabel("Residue", fontsize=LABEL_FONTSIZE * font_scale)
     ax.set_ylabel("Residue", fontsize=LABEL_FONTSIZE * font_scale)
     if title:
@@ -119,6 +139,8 @@ def plot_bias_with_contacts(bias_2d, contacts, title, save_path, font_scale=1.0)
     cbar.set_label("Attention Bias", fontsize=CBAR_LABEL_FONTSIZE * font_scale)
     cbar.ax.tick_params(labelsize=(TICK_FONTSIZE - 2) * font_scale)
 
+    # ax.contour() doesn't auto-generate a legend entry, so a Line2D proxy artist
+    # (never actually drawn) supplies the legend label/color for the contact contour.
     legend_elements = [
         Line2D([0], [0], color="lime", linewidth=CONTACT_LINEWIDTH,
                label=f"Contacts\n(<{CONTACT_THRESHOLD}Å)")
@@ -134,6 +156,7 @@ def plot_bias_with_contacts(bias_2d, contacts, title, save_path, font_scale=1.0)
 # Main
 # =============================================================================
 def parse_args():
+    """Parse command-line arguments for the 1l0s bias-map extraction script."""
     parser = argparse.ArgumentParser(
         description="Extract bias maps for 1l0s",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -148,6 +171,7 @@ def parse_args():
 
 
 def main():
+    """Entry point: extract and plot 1l0s bias maps (per-block averages + per-head detail)."""
     args = parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output, exist_ok=True)
@@ -158,7 +182,7 @@ def main():
     print(f"Loading data from {args.parquet} ...")
     df = pd.read_parquet(args.parquet)
     donors = df[["donor_pdb", "donor_sequence", "donor_hairpin_start", "donor_hairpin_end"]].drop_duplicates()
-    row = donors[donors["donor_pdb"].str.contains("1l0s", case=False)]
+    row = donors[donors["donor_pdb"].str.contains("1l0s", case=False)]  # case-insensitive substring match
     if len(row) == 0:
         raise ValueError("1l0s not found in parquet. Available PDBs: "
                          + ", ".join(donors["donor_pdb"].unique()[:20]))
@@ -170,17 +194,22 @@ def main():
     # ------------------------------------------------------------------
     # 2. Load model
     # ------------------------------------------------------------------
-    print(f"Loading ESMFold on {device} ...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    model, tokenizer = load_esmfold(device)
 
     # ------------------------------------------------------------------
     # 3. Single forward pass — collect biases at all requested blocks
     # ------------------------------------------------------------------
+    # NOTE: possible bug -- this existing comment says "HEAD_DETAIL_BLOCK (30)", but
+    # HEAD_DETAIL_BLOCK is defined as 32 above; the comment appears stale (harmless
+    # here since 32 is indeed still present in BLOCKS, so the invariant it's
+    # asserting still happens to hold).
     blocks_needed = set(BLOCKS)  # HEAD_DETAIL_BLOCK (30) is already in BLOCKS
     collected = {"biases": {}}
     original_forward = model.trunk.forward
 
+    # One model call collects every block's bias at once (instead of one forward
+    # pass per block), since all requested blocks are checked inside the same
+    # trunk_iter loop.
     new_forward = make_collecting_trunk_forward(blocks_needed, HEAD_DETAIL_BLOCK, collected)
     model.trunk.forward = types.MethodType(new_forward, model.trunk)
 
@@ -189,15 +218,20 @@ def main():
         inputs = tokenizer(sequence, return_tensors="pt", add_special_tokens=False).to(device)
         outputs = model(**inputs, num_recycles=0)
 
+    # NOTE: possible bug -- no try/finally around the forward pass above; if
+    # model(**inputs, ...) raises, model.trunk.forward is never restored and stays
+    # monkey-patched for the lifetime of this model object.
     model.trunk.forward = original_forward  # restore
 
     # ------------------------------------------------------------------
     # 4. Compute contact map from predicted structure
     # ------------------------------------------------------------------
     ca_positions = outputs.positions[-1, 0, :, 1, :]  # (L, 3) — CA atoms
+    # outputs.positions: [n_recycles, batch, L, n_atoms, 3]; [-1] = final structure,
+    # [0] = batch index, atom index 1 = Cα (backbone atoms ordered N, CA, C, ...).
     diff = ca_positions.unsqueeze(0) - ca_positions.unsqueeze(1)
     distances = torch.sqrt((diff ** 2).sum(-1)).cpu().numpy()
-    contacts = (distances < args.contact_threshold).astype(float)
+    contacts = (distances < args.contact_threshold).astype(float)  # binary contact map at the configured Å cutoff
     print(f"Contact map: {int(contacts.sum())} pairs < {args.contact_threshold}Å")
 
     # ------------------------------------------------------------------
@@ -206,11 +240,14 @@ def main():
     print(f"\nSaving head-averaged bias maps for {len(BLOCKS)} blocks ...")
     for block_idx in tqdm(BLOCKS, desc="Block maps"):
         bias = collected["biases"][block_idx]          # (1, L, L, H)
+        # (averaged over attention heads)
         bias_avg = bias[0].mean(dim=-1).cpu().numpy()  # (L, L)
 
         save_path = os.path.join(args.output, f"1l0s_block{block_idx:02d}_avg.png")
 
         if block_idx == HEAD_DETAIL_BLOCK:
+            # The detail block additionally gets a "clean" (no title, larger font)
+            # version, on top of the normal titled version every block gets below.
             # Clean version: no title, 2.5x fonts
             clean_path = os.path.join(args.output, f"1l0s_block{block_idx:02d}_avg_clean.png")
             plot_bias_with_contacts(
@@ -240,6 +277,7 @@ def main():
     print(f"\nSaving per-head bias maps for block {HEAD_DETAIL_BLOCK} ...")
     detail_bias = collected["biases"][HEAD_DETAIL_BLOCK]  # (1, L, L, H)
     for head_idx in tqdm(range(NUM_HEADS), desc="Head maps"):
+        # (this head only, no averaging across heads)
         bias_head = detail_bias[0, :, :, head_idx].cpu().numpy()  # (L, L)
 
         save_path = os.path.join(args.output, f"1l0s_block{HEAD_DETAIL_BLOCK:02d}_head{head_idx}.png")
@@ -253,6 +291,8 @@ def main():
     # ------------------------------------------------------------------
     # Done
     # ------------------------------------------------------------------
+    # len(BLOCKS) normal per-block maps, + 1 extra "clean" version of the detail
+    # block, + NUM_HEADS per-head maps at the detail block.
     n_files = len(BLOCKS) + NUM_HEADS + 1  # +1 for clean version of detail block
     print(f"\n✓ Saved {n_files} plots to {args.output}/")
     torch.cuda.empty_cache()

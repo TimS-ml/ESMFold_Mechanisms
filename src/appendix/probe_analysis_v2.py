@@ -37,13 +37,17 @@ from transformers.utils import ContextManagers
 
 from src.utils.trunk_utils import detect_hairpins
 from src.utils.representation_utils import CollectedRepresentations, TrunkHooks
+from src.utils.model_utils import load_esmfold  # shared precision-aware ESMFold loader
 
 
 # ============================================================================
 # CONSTANTS
 # ============================================================================
 
-NUM_BLOCKS = 48
+NUM_BLOCKS = 48  # ESMFold's folding trunk has 48 EsmFoldTriangularSelfAttentionBlocks
+# The 20 standard amino acids (one-letter codes), in alphabetical order; ambiguity/
+# non-standard codes (B, J, O, U, X, Z, *) are deliberately excluded since probes
+# below classify into this fixed 20-way vocabulary.
 AA_LIST = list("ACDEFGHIKLMNPQRSTVWY")
 AA_TO_IDX = {aa: i for i, aa in enumerate(AA_LIST)}
 IDX_TO_AA = {i: aa for aa, i in AA_TO_IDX.items()}
@@ -68,8 +72,13 @@ def run_and_collect_all(
     - seq2pair updates
     - pair2seq biases
     """
+    # Empty container that the hook callbacks below will populate as a side effect
+    # of running the forward pass.
     collector = CollectedRepresentations()
     
+    # Register forward hooks on every trunk block (and their sequence_to_pair /
+    # pair_to_sequence submodules); this is the "install" half of the hook
+    # lifecycle -- see the try/finally below for the matching "remove" half.
     trunk_hooks = TrunkHooks(model.trunk, collector)
     trunk_hooks.register(
         collect_s=True,
@@ -80,9 +89,19 @@ def run_and_collect_all(
     
     try:
         with torch.no_grad():
+            # add_special_tokens=False: ESMFold has no BOS/EOS tokens, sequence
+            # positions must line up 1:1 with residues for the trunk/structure module.
             inputs = tokenizer(sequence, return_tensors='pt', add_special_tokens=False).to(device)
+            # num_recycles=0 (the default) -> a single trunk pass with no recycling,
+            # trading some structure-prediction accuracy for speed since this function
+            # is called once per sequence across potentially large probing datasets
+            # and only the internal representations (not final structure quality)
+            # are actually needed here.
             outputs = model(**inputs, num_recycles=num_recycles)
     finally:
+        # Always remove the hooks, even if the forward pass raised -- otherwise
+        # repeated calls to this function would stack duplicate hooks (multiplying
+        # compute and redundantly overwriting collector entries on every call).
         trunk_hooks.remove()
     
     return outputs, collector
@@ -102,11 +121,18 @@ def create_pairwise_mask(
     mode: str,
 ) -> torch.Tensor:
     """Create pairwise patch mask."""
+    # (target_len, target_len) boolean mask: True where a pairwise (i, j) entry
+    # should be overwritten with the donor's corresponding entry.
     mask = torch.zeros(target_len, target_len, dtype=torch.bool)
     
     if mode == "intra":
+        # Only the hairpin's own i,j-both-inside-the-span entries are patched.
         mask[target_start:target_end, target_start:target_end] = True
     elif mode in ("touch", "hole"):
+        # These modes also patch the *cross* terms between the hairpin span and its
+        # flanking context, to transplant context-dependent interactions too.
+        # left/right_extent is capped by whichever of donor or target has less room
+        # on that side, so the transplanted window can't run off either sequence.
         left_extent = min(donor_start, target_start)
         right_extent = min(donor_len - donor_end, target_len - target_end)
         
@@ -117,6 +143,10 @@ def create_pairwise_mask(
         mask[transport_start:transport_end, target_start:target_end] = True
         
         if mode == "hole":
+            # "hole" patches only the flanking cross terms, explicitly excluding the
+            # hairpin's own intra-span block -- a specificity control for whether
+            # patching context alone (without touching the hairpin itself) still
+            # transfers structural information.
             mask[target_start:target_end, target_start:target_end] = False
     
     return mask
@@ -143,22 +173,33 @@ def make_trunk_patch_and_collect_forward(
     """
     
     def forward(self, seq_feats, pair_feats, true_aa, residx, mask, no_recycles):
+        """Patched EsmFoldingTrunk.forward: runs the real blocks unmodified, then applies+collects around them."""
         device = seq_feats.device
         s_s_0, s_z_0 = seq_feats, pair_feats
 
         if no_recycles is None:
             no_recycles = self.config.max_recycles
         else:
+            # "+1" because the first recycle is just the standard forward pass
+            # (matches the convention in the real EsmFoldingTrunk.forward).
             no_recycles += 1
 
         def apply_patch(block_idx, s, z):
             """Apply donor patch at the target block."""
+            # The patch only fires at exactly one block index; every other block's
+            # output passes through unchanged.
             if block_idx != patch_block:
                 return s, z
             
             if patch_mode in ('both', 'sequence') and block_idx in donor_s_blocks:
                 donor_s = donor_s_blocks[block_idx].to(s.device, dtype=s.dtype)
+                # Clone before in-place indexed assignment below so we don't mutate
+                # the tensor object the just-executed real block returned (which may
+                # still be referenced elsewhere).
                 s = s.clone()
+                # donor_s was already sliced to just the hairpin span in
+                # get_donor_representations(), so this directly overwrites the
+                # target's per-residue embeddings in the patched span.
                 s[:, target_start:target_end, :] = donor_s
             
             if patch_mode in ('both', 'pairwise') and block_idx in donor_z_blocks:
@@ -166,19 +207,33 @@ def make_trunk_patch_and_collect_forward(
                 mask_dev = pairwise_mask.to(z.device)
                 z = z.clone()
                 
+                # Iterate element-by-element (rather than fully vectorized fancy
+                # indexing) because each masked (ti, tj) target coordinate must be
+                # affine-shifted into a *different* donor coordinate system and then
+                # bounds-checked individually; simpler to express as a Python loop
+                # at some performance cost for large masks.
                 indices = torch.where(mask_dev)
                 for i in range(len(indices[0])):
                     ti, tj = indices[0][i].item(), indices[1][i].item()
                     di = ti - target_start + donor_start
                     dj = tj - target_start + donor_start
+                    # Guards against the shifted donor index falling outside the
+                    # donor's actual pairwise tensor (relevant for "touch"/"hole"
+                    # mode's flanking regions when donor/target have different
+                    # amounts of available flanking context).
                     if 0 <= di < donor_z.shape[1] and 0 <= dj < donor_z.shape[2]:
                         z[:, ti, tj, :] = donor_z[:, di, dj, :]
             
             return s, z
 
         def trunk_iter(s, z, residx, mask):
+            """Run all trunk blocks once, patching at `patch_block` and collecting s/z/seq2pair/bias at every block."""
             z = z + self.pairwise_positional_embedding(residx, mask=mask)
             
+            # Fresh each call (i.e. each recycle iteration) -- if no_recycles > 1,
+            # only the *last* iteration's `collected` ends up on the returned
+            # structure dict below. Fine in practice since every caller in this file
+            # passes num_recycles=0 (exactly one iteration).
             collected = {
                 's_list': [],
                 'z_list': [],
@@ -188,13 +243,24 @@ def make_trunk_patch_and_collect_forward(
             
             for block_idx, block in enumerate(self.blocks):
                 # Collect pair2seq bias BEFORE block computation
+                # (this recomputes exactly the first line of the real block's
+                # forward using the same z about to be passed to block(...) below,
+                # so it's numerically identical to what the block itself uses, not
+                # an approximation)
                 bias = block.pair_to_sequence(z)
                 collected['pair2seq_bias_list'].append(bias.detach().cpu())
                 
                 # Run block
+                # (delegates to the real, unmodified block module -- unlike the
+                # pair_to_sequence/sequence_to_pair recomputations here, this is
+                # where s/z actually get computed, so this file's s/z stay
+                # numerically faithful to an ordinary unpatched ESMFold forward
+                # pass up through this point)
                 s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
                 
                 # Apply patch AFTER block computation
+                # (i.e. block_idx runs normally first; only at the designated
+                # patch_block is its *output* overwritten before block_idx+1 sees it)
                 s, z = apply_patch(block_idx, s, z)
                 
                 # Collect outputs
@@ -203,6 +269,12 @@ def make_trunk_patch_and_collect_forward(
                 
                 # Collect seq2pair (would need to extract from block internals)
                 # For now, approximate with outer product of s
+                # (despite "approximate", this is actually exact: `s` here is
+                # precisely the sequence_state the real block internally used for
+                # its own sequence_to_pair() call -- nothing modifies s between the
+                # block's mlp_seq step and its return, so recomputing
+                # sequence_to_pair(s) reproduces that value exactly, whether or not
+                # apply_patch() just overwrote s at this block)
                 seq2pair_approx = block.sequence_to_pair(s)
                 collected['seq2pair_list'].append(seq2pair_approx.detach().cpu())
             
@@ -214,6 +286,8 @@ def make_trunk_patch_and_collect_forward(
         recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
 
         for recycle_idx in range(no_recycles):
+            # Matches upstream EsmFoldingTrunk.forward: gradients are only needed
+            # through the final recycle iteration.
             with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
                 recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
                 recycle_z = self.recycle_z_norm(recycle_z.detach()).to(device)
@@ -227,6 +301,9 @@ def make_trunk_patch_and_collect_forward(
                 )
 
                 recycle_s, recycle_z = s_s, s_z
+                # 3.375 / 21.375 are the min/max CB-CB distance bin boundaries in
+                # Angstroms (AlphaFold-style distogram binning) used to build the
+                # recycled structural prior for the next iteration.
                 recycle_bins = EsmFoldingTrunk.distogram(
                     structure["positions"][-1][:, :, :3],
                     3.375, 21.375, self.recycle_bins,
@@ -260,6 +337,7 @@ def patch_and_collect(
             outputs = model(**inputs)
             collected = outputs['collected']  # Contains s_list, z_list, etc.
     """
+    # Hook lifecycle: save the original bound method so it can be restored below.
     original = model.trunk.forward
     
     patched_forward = make_trunk_patch_and_collect_forward(
@@ -267,11 +345,15 @@ def patch_and_collect(
         target_start, target_end, donor_start,
         pairwise_mask, patch_mode, patch_block,
     )
+    # types.MethodType binds patched_forward as a bound method of this specific
+    # model.trunk instance only, so other model instances (if any) are unaffected.
     model.trunk.forward = types.MethodType(patched_forward, model.trunk)
     
     try:
         yield
     finally:
+        # Always restore the original forward, even if the caller's `with` block
+        # raised, so subsequent calls to `model` see normal (unpatched) behavior.
         model.trunk.forward = original
 
 
@@ -283,10 +365,12 @@ class LinearProbe(nn.Module):
     """Simple linear probe for AA prediction."""
     
     def __init__(self, input_dim: int, num_classes: int = NUM_AAS):
+        """Build a single nn.Linear layer mapping input_dim -> num_classes."""
         super().__init__()
         self.linear = nn.Linear(input_dim, num_classes)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return per-class logits for input features `x`."""
         return self.linear(x)
 
 
@@ -313,6 +397,9 @@ def train_probes_online(
     print(f"Training probes on {len(train_seqs)} sequences for {n_epochs} epochs...")
     
     # Get sample to determine dimensions
+    # (first sequence containing only canonical amino acids, used purely as a
+    # warm-up forward pass to read off each component's real feature dimensionality
+    # below, rather than hardcoding it)
     sample_seq = next((s for s in train_seqs if all(aa in AA_TO_IDX for aa in s)), None)
     if sample_seq is None:
         raise ValueError("No valid sequences found")
@@ -320,6 +407,8 @@ def train_probes_online(
     _, sample_collected = run_and_collect_all(model, tokenizer, device, sample_seq)
     
     # Initialize probes
+    # One independent LinearProbe (and its own Adam optimizer) per (block, component)
+    # combination -- i.e. NUM_BLOCKS x 4 = 192 independent single-layer classifiers.
     probes = {}
     optimizers = {}
     
@@ -340,6 +429,8 @@ def train_probes_online(
                 probe.parameters(), lr=lr, weight_decay=1e-4
             )
     
+    # Free the (large -- captures all NUM_BLOCKS blocks x 4 components for one
+    # sequence) warm-up collection before the main training loop below.
     del sample_collected
     torch.cuda.empty_cache()
     
@@ -347,6 +438,7 @@ def train_probes_online(
     
     # Training loop
     for epoch in range(n_epochs):
+        # Reshuffle sequence order each epoch (standard SGD practice)
         seq_order = np.random.permutation(len(train_seqs))
         epoch_losses = {b: {c: [] for c in ['s', 'z', 'seq2pair', 'bias']} for b in blocks_to_train}
         
@@ -354,6 +446,9 @@ def train_probes_online(
         for seq_idx in pbar:
             seq = train_seqs[seq_idx]
             
+            # Probes classify into the fixed 20-AA vocabulary (AA_TO_IDX), so any
+            # sequence containing non-standard/ambiguous residues can't be labeled
+            # and is skipped entirely.
             if not all(aa in AA_TO_IDX for aa in seq):
                 continue
             
@@ -361,11 +456,15 @@ def train_probes_online(
             L = len(seq)
             
             # Sample pairs for pairwise components
+            # (full L x L off-diagonal pair set is subsampled down to n_pairs_per_seq
+            # for compute/memory efficiency; i != j excludes the degenerate diagonal)
             pairs = [(i, j) for i in range(L) for j in range(L) if i != j]
             n_pairs = min(n_pairs_per_seq, len(pairs))
             sampled_pairs = [pairs[k] for k in np.random.choice(len(pairs), n_pairs, replace=False)]
             
             # Labels
+            # Pairwise probes are trained to recover the identity of residue i (the
+            # row index) specifically from each pairwise feature z[i, j] (not j).
             seq_labels = torch.tensor([AA_TO_IDX[aa] for aa in seq], dtype=torch.long, device=device)
             pair_labels_i = torch.tensor([AA_TO_IDX[seq[i]] for i, j in sampled_pairs], 
                                          dtype=torch.long, device=device)
@@ -377,6 +476,8 @@ def train_probes_online(
                 bias = collected.pair2seq_biases[block_idx][0].to(device)
                 
                 # Train s probe (per-residue)
+                # Standard supervised step: forward -> cross-entropy loss -> backward
+                # -> optimizer step, repeated per (block, component) below too.
                 probes[block_idx]['s'].train()
                 optimizers[block_idx]['s'].zero_grad()
                 logits_s = probes[block_idx]['s'](s)
@@ -387,6 +488,7 @@ def train_probes_online(
                 
                 # Train pairwise probes
                 for component, tensor in [('z', z), ('seq2pair', seq2pair), ('bias', bias)]:
+                    # Gather the sampled_pairs' (i, j) feature vectors into one batch
                     pair_features = torch.stack([tensor[i, j] for i, j in sampled_pairs])
                     
                     probes[block_idx][component].train()
@@ -397,9 +499,13 @@ def train_probes_online(
                     optimizers[block_idx][component].step()
                     epoch_losses[block_idx][component].append(loss.item())
             
+            # Free this sequence's (potentially large -- all blocks x components)
+            # collected representations before moving to the next sequence.
             del collected
             torch.cuda.empty_cache()
             
+            # Progress-bar display only: average loss from one representative block
+            # (not all blocks_to_train, purely to keep the postfix cheap to compute).
             avg_loss = np.mean([np.mean(epoch_losses[blocks_to_train[0]][c]) 
                                for c in ['s', 'z', 'seq2pair', 'bias']])
             pbar.set_postfix({'avg_loss': f'{avg_loss:.3f}'})
@@ -422,6 +528,8 @@ def evaluate_probes(
     all_preds = {b: {c: [] for c in ['s', 'z', 'seq2pair', 'bias']} for b in blocks_to_train}
     all_labels = {b: {c: [] for c in ['s', 'z', 'seq2pair', 'bias']} for b in blocks_to_train}
     
+    # Same per-sequence setup (skip non-canonical AAs, sample pairs, label by
+    # residue i) as train_probes_online() above, but in eval mode with no backward.
     for seq in tqdm(test_seqs, desc="Evaluating"):
         if not all(aa in AA_TO_IDX for aa in seq):
             continue
@@ -443,6 +551,9 @@ def evaluate_probes(
             bias = collected.pair2seq_biases[block_idx][0].to(device)
             
             # Evaluate s probe
+            # argmax -> hard predicted class index (not just logits/probabilities),
+            # moved to CPU as a plain list since sklearn's accuracy_score below
+            # needs plain arrays, not GPU tensors.
             probes[block_idx]['s'].eval()
             with torch.no_grad():
                 preds_s = probes[block_idx]['s'](s).argmax(dim=-1).cpu().tolist()
@@ -497,6 +608,10 @@ def save_probes(
     os.makedirs(os.path.dirname(path), exist_ok=True)
     
     # Save state dicts along with architecture info
+    # Three parts: raw weights ('probes_state'), the input/output dims needed to
+    # reconstruct a fresh LinearProbe of the right shape before loading weights into
+    # it ('probe_config'), and bookkeeping so load_probes() doesn't need any
+    # external knowledge of the block/component/AA setup used here ('metadata').
     save_dict = {
         'probes_state': {
             block_idx: {
@@ -517,6 +632,8 @@ def save_probes(
         },
         'metadata': {
             'num_blocks': len(probes),
+            # Component names (e.g. ['s','z','seq2pair','bias']) read off an
+            # arbitrary (the first) block, assuming every block has the same set.
             'components': list(next(iter(probes.values())).keys()) if probes else [],
             'aa_list': AA_LIST,
         }
@@ -546,6 +663,9 @@ def load_probes(
     for block_idx, block_config in save_dict['probe_config'].items():
         probes[block_idx] = {}
         for component, config in block_config.items():
+            # Reconstruct a freshly-shaped LinearProbe from the saved config first --
+            # load_state_dict() below requires the module to already have the
+            # matching parameter shapes.
             probe = LinearProbe(
                 input_dim=config['input_dim'],
                 num_classes=config['num_classes'],
@@ -581,10 +701,16 @@ def get_donor_representations(
     """
     _, donor_collected = run_and_collect_all(model, tokenizer, device, donor_seq)
     
+    # Sequence repr is pre-sliced to just the hairpin span since that's the only
+    # part that will ever be transplanted into a target's `s`.
     donor_s_blocks = {
         k: v[:, donor_start:donor_end, :] 
         for k, v in donor_collected.s_blocks.items()
     }
+    # Pairwise repr is kept in FULL (not pre-sliced) because "touch"/"hole" patch
+    # modes may need cross terms between the hairpin and flanking context, whose
+    # exact extent isn't known until patch time -- slicing is deferred to
+    # apply_patch()/create_pairwise_mask() instead.
     donor_z_blocks = donor_collected.z_blocks  # Full matrices
     
     return donor_s_blocks, donor_z_blocks
@@ -609,6 +735,11 @@ def run_patched_forward_with_collection(
     
     This uses a modified trunk forward that both patches and collects.
     """
+    # Assumes the donor hairpin span is exactly as long as the target patch span
+    # (donor_end here is derived from the target's length, not the donor's own
+    # original hairpin boundary) -- required so donor_s_blocks (already sliced to
+    # [donor_start:donor_end] by get_donor_representations) lines up 1:1 with
+    # s[:, target_start:target_end, :] in apply_patch().
     donor_end = donor_start + (target_end - target_start)
     
     pairwise_mask = create_pairwise_mask(
@@ -621,6 +752,10 @@ def run_patched_forward_with_collection(
         mode=patch_mask_mode,
     )
     
+    # Hook lifecycle: save the original bound method (installed below, restored in
+    # the finally block) -- same pattern as patch_and_collect() above, done inline
+    # here instead because this function also needs to hand-roll the pre-trunk
+    # input prep below.
     original_forward = model.trunk.forward
     
     patched_forward = make_trunk_patch_and_collect_forward(
@@ -637,6 +772,10 @@ def run_patched_forward_with_collection(
             
             # We need to call trunk directly to get the collected outputs
             # First prepare the inputs like ESMFold does
+            # (model.forward() doesn't expose the raw structure dict that
+            # model.trunk(...) returns -- and `collected` only lives on that dict --
+            # so everything model.forward() normally does before invoking
+            # self.trunk(...) must be manually reproduced here)
             aa = inputs['input_ids']
             B, L = aa.shape
             
@@ -658,9 +797,11 @@ def run_patched_forward_with_collection(
             # Call trunk with patched forward
             structure = model.trunk(s_s_0, s_z_0, aa, position_ids, attention_mask, no_recycles=0)
             
+            # Defensive default in case patching somehow didn't populate 'collected'
             collected = structure.get('collected', {})
             
     finally:
+        # Always restore the original trunk forward, even on exception.
         model.trunk.forward = original_forward
     
     return collected
@@ -684,6 +825,9 @@ def probe_readout_at_block(
     
     Compares predictions from target (unpatched) vs patched representations.
     """
+    # Only iterate over the overlapping length between target and donor patch spans
+    # (defensive against any target/donor length mismatch, unlike the hard equal-
+    # length assumption made when the patch was actually applied).
     patch_len = min(target_end - target_start, donor_end - donor_start)
     results = []
     
@@ -703,6 +847,9 @@ def probe_readout_at_block(
         target_aa_idx = AA_TO_IDX[target_aa]
         donor_aa_idx = AA_TO_IDX[donor_aa]
         
+        # Per-residue bookkeeping used later to test the module's core hypothesis:
+        # does the probe's predicted AA shift toward the donor's identity after
+        # patching, specifically at positions where donor/target AAs actually differ?
         result = {
             'block_idx': block_idx,
             'target_pos': target_pos,
@@ -713,17 +860,23 @@ def probe_readout_at_block(
         }
         
         # Get representations from target (unpatched)
+        # [0] indexes into the batch dim (batch size is always 1 in this script)
         s_target = target_collected.s_blocks[block_idx][0]
         z_target = target_collected.z_blocks[block_idx][0]
         seq2pair_target = target_collected.seq2pair_updates.get(block_idx, torch.zeros_like(z_target))[0]
         bias_target = target_collected.pair2seq_biases.get(block_idx, torch.zeros_like(s_target))[0]
         
         # Get representations from patched
+        # Falls back to the (unpatched) target's own representation if a given
+        # component wasn't collected for the patched run, so this doesn't crash on
+        # a missing key -- though it does then read as "no observable patch effect"
+        # for that component.
         s_patched = patched_collected['s_list'][block_idx][0] if patched_collected.get('s_list') else s_target
         z_patched = patched_collected['z_list'][block_idx][0] if patched_collected.get('z_list') else z_target
         seq2pair_patched = patched_collected['seq2pair_list'][block_idx][0] if patched_collected.get('seq2pair_list') else seq2pair_target
         bias_patched = patched_collected['pair2seq_bias_list'][block_idx][0] if patched_collected.get('pair2seq_bias_list') else bias_target
         
+        # Mask excluding the self-pair (diagonal) when averaging over a pairwise row below
         j_mask = torch.arange(z_target.shape[0]) != target_pos
         
         for component in ['s', 'z', 'seq2pair', 'bias']:
@@ -732,6 +885,10 @@ def probe_readout_at_block(
             
             probe = probes[block_idx][component]
             
+            # 's' is already per-residue, used directly; the pairwise components
+            # ('z'/'seq2pair'/'bias') average target_pos's row over all valid j != 
+            # target_pos partners into one feature vector, matching how the probes
+            # were trained (see train_probes_online's per-pair sampling).
             if component == 's':
                 feat_base = s_target[target_pos]
                 feat_patch = s_patched[target_pos]
@@ -753,6 +910,7 @@ def probe_readout_at_block(
             
             probe.eval()
             with torch.no_grad():
+                # unsqueeze(0) restores the batch dim of 1 expected by LinearProbe
                 logits_base = probe(feat_base.unsqueeze(0).to(device))
                 logits_patch = probe(feat_patch.unsqueeze(0).to(device))
                 
@@ -762,6 +920,8 @@ def probe_readout_at_block(
                 pred_base = logits_base.argmax().item()
                 pred_patch = logits_patch.argmax().item()
             
+            # Wide-format columns, prefixed per component, assembled into one row
+            # per position so downstream comparison/plotting can pivot on any of them.
             result[f'{component}_pred_base'] = IDX_TO_AA[pred_base]
             result[f'{component}_pred_patch'] = IDX_TO_AA[pred_patch]
             result[f'{component}_prob_target_base'] = probs_base[target_aa_idx].item()
@@ -793,7 +953,7 @@ def plot_probe_accuracies(accuracy_df: pd.DataFrame, output_dir: str):
                 f'{markers[component]}-', color=colors[component], 
                 label=component, linewidth=2, markersize=6)
     
-    ax.axhline(y=1/NUM_AAS, color='gray', linestyle='--', alpha=0.5, label='Chance')
+    ax.axhline(y=1/NUM_AAS, color='gray', linestyle='--', alpha=0.5, label='Chance')  # 1/20 = random-guess accuracy over the 20-AA vocabulary
     ax.set_xlabel('Block Index', fontsize=12)
     ax.set_ylabel('Test Accuracy', fontsize=12)
     ax.set_title('Probe Test Accuracy by Block and Component', fontsize=14)
@@ -814,22 +974,29 @@ def plot_probe_readout_summary(results_df: pd.DataFrame, output_dir: str):
         return
     
     # Filter to positions where AA changed
+    # (only where donor/target AAs actually differ can a shift "toward the donor"
+    # be observed at all -- where they're identical, base and patched targets
+    # trivially agree)
     diff_df = results_df[results_df['aa_changed'] == True]
     
     if len(diff_df) == 0:
         print("No AA changes found in results")
         return
     
+    # Enumerate the distinct (patch_block, patch_mode) experimental conditions
+    # present in the results; one subplot will be drawn per condition below.
     configs = diff_df.groupby(['patch_block', 'patch_mode']).size().reset_index()[['patch_block', 'patch_mode']]
     
     n_configs = len(configs)
     if n_configs == 0:
         return
     
+    # Grid sized at up to 3 columns; n_rows uses ceiling division so all configs fit.
     n_cols = min(3, n_configs)
     n_rows = (n_configs + n_cols - 1) // n_cols
     
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+    # Flatten the 2D subplot grid so it can be indexed by a single running config_idx
     axes = axes.flatten()
     
     colors = {'s': '#2ecc71', 'z': '#3498db', 'seq2pair': '#e67e22', 'bias': '#e74c3c'}
@@ -851,8 +1018,8 @@ def plot_probe_readout_summary(results_df: pd.DataFrame, output_dir: str):
                 ax.plot(grouped.index, grouped.values, 'o-', color=color, 
                         linewidth=2, markersize=5, label=comp)
         
-        ax.axhline(y=1/NUM_AAS, color='gray', linestyle='--', alpha=0.5)
-        ax.axvline(x=patch_block, color='red', linewidth=2, linestyle='--', alpha=0.5)
+        ax.axhline(y=1/NUM_AAS, color='gray', linestyle='--', alpha=0.5)  # chance level
+        ax.axvline(x=patch_block, color='red', linewidth=2, linestyle='--', alpha=0.5)  # marks the block where the patch was applied
         
         ax.set_xlabel('Block', fontsize=10)
         ax.set_ylabel('P(donor AA)', fontsize=10)
@@ -861,6 +1028,8 @@ def plot_probe_readout_summary(results_df: pd.DataFrame, output_dir: str):
         ax.grid(alpha=0.3)
         ax.set_ylim(0, 1)
     
+    # Grid may have more cells than configs (e.g. 5 configs in a 2x3 grid); hide the
+    # unused trailing subplot(s) rather than leaving them as empty default axes.
     for idx in range(n_configs, len(axes)):
         axes[idx].set_visible(False)
     
@@ -877,6 +1046,7 @@ def plot_probe_readout_summary(results_df: pd.DataFrame, output_dir: str):
 # ============================================================================
 
 def parse_args():
+    """Parse command-line arguments for the probe training/loading + patching experiment."""
     parser = argparse.ArgumentParser(description='ESMFold Probing Analysis (Refactored)')
     parser.add_argument('--probing_dataset', type=str, default='data/probing_dataset.csv',
                         help='Path to CSV with train/test sequences')
@@ -899,7 +1069,7 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--patch_blocks', type=int, nargs='+', default=[0, 27],
-                        help='Blocks to test patching at')
+                        help='Blocks to test patching at')  # default: an early block and one later block; override to test others
     parser.add_argument('--flush_every', type=int, default=10,
                         help='Save results every N cases')
     parser.add_argument('--probes_path', type=str, default=None,
@@ -910,6 +1080,7 @@ def parse_args():
 
 
 def main():
+    """Run probe training (or loading), then the block-patching + probe-readout experiment, saving plots/results to --output."""
     args = parse_args()
     
     os.makedirs(args.output, exist_ok=True)
@@ -923,9 +1094,7 @@ def main():
     probes_path = args.probes_path or os.path.join(args.output, 'models', 'residue_probes.pt')
     
     # Load model
-    print("Loading ESMFold model...")
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    model, tokenizer = load_esmfold(device)
     
     # =========================================================================
     # EXPERIMENT 1: Probe Training (or Loading)
@@ -938,6 +1107,8 @@ def main():
     
     if args.load_probes and os.path.exists(probes_path):
         # Load existing probes
+        # (skips evaluate_probes()/accuracy plotting below entirely -- only the
+        # freshly-trained path re-evaluates)
         print(f"\nLoading probes from {probes_path}...")
         probes = load_probes(probes_path, device=device)
     else:
@@ -997,6 +1168,9 @@ def main():
     all_results = []
     results_path = os.path.join(args.output, 'patching_results.parquet')
     
+    # Triple-nested loop: for each (target, donor) case, for each candidate patch
+    # point, probe every block strictly after the patch to see how the injected
+    # donor signal propagates/decays through the remaining trunk.
     for case_idx, row in tqdm(patch_df.iterrows(), total=len(patch_df), desc="Patching"):
         target_seq = row['target_sequence']
         donor_seq = row['donor_sequence']
@@ -1023,6 +1197,8 @@ def main():
             )
             
             # Probe readout at all blocks after the patch block
+            # (before the patch, target and patched representations are identical
+            # by construction, so there's nothing to observe there)
             for obs_block in range(patch_block + 1, 48):
                 readout = probe_readout_at_block(
                     probes, obs_block, target_seq, donor_seq,
@@ -1038,12 +1214,16 @@ def main():
                     all_results.append(readout)
         
         # Flush periodically
+        # (persists partial results every --flush_every cases as a checkpoint, so a
+        # crash/interruption during this potentially long-running loop doesn't lose
+        # all progress)
         if (case_idx + 1) % args.flush_every == 0:
             print(f"\n  Flushing results ({case_idx + 1} cases)...")
             interim_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
             if len(interim_df) > 0:
                 interim_df.to_parquet(results_path, index=False)
         
+        # Free this case's (potentially large) representations before the next case.
         del target_collected, donor_s_blocks, donor_z_blocks
         torch.cuda.empty_cache()
     

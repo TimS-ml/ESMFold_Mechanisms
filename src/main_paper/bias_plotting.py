@@ -16,6 +16,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
+# Shared helper: loads facebook/esmfold_v1 + tokenizer with auto-selected precision (see model_utils.py).
+from src.utils.model_utils import load_esmfold
+
 # =============================================================================
 # CONFIGURATION - Edit these to iterate quickly
 # =============================================================================
@@ -50,27 +53,33 @@ def plot_global_auc(metrics_df: pd.DataFrame, output_dir: str):
     """Plot Global Contact AUC across blocks."""
     fig, ax = plt.subplots(figsize=FIGSIZE)
     
+    # Average AUC across all analyzed sequences, per block.
     agg = metrics_df.groupby('block_idx')['global_auc'].mean().reset_index()
     
     # Apply smoothing
+    # center=True: window centered on each block (uses neighbors on both sides);
+    # min_periods=1 avoids NaN at the edge blocks where a full window isn't available.
+    # SMOOTHING_WINDOW=1 above makes this a no-op (rolling mean over a single point).
     agg['global_auc_smooth'] = agg['global_auc'].rolling(
         window=SMOOTHING_WINDOW, center=True, min_periods=1
     ).mean()
     
     # Fill under curve
+    # Shades the area between chance-level (0.5) and the AUC curve, visually
+    # emphasizing how far above/below chance the contact-prediction AUC is.
     ax.fill_between(agg['block_idx'], 0.5, agg['global_auc_smooth'],
                    alpha=FILL_ALPHA, color=COLOR_GLOBAL)
     # Line
     ax.plot(agg['block_idx'], agg['global_auc_smooth'], 
            'o-', color=COLOR_GLOBAL, label='Global AUC', markersize=5, linewidth=2.5)
     
-    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
+    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)  # chance-level AUC reference line
     
     ax.set_xlabel('Block', fontsize=LABEL_FONTSIZE)
     ax.set_ylabel('Contact Prediction AUC', fontsize=LABEL_FONTSIZE)
     ax.set_title('Global: Pair2Seq Bias Contact AUC', fontsize=TITLE_FONTSIZE, pad=12)
     ax.set_ylim(0.4, 1.0)
-    ax.set_xlim(0, 47)
+    ax.set_xlim(0, 47)  # 47 = index of the last (48th) trunk block
     ax.tick_params(axis='both', labelsize=TICK_FONTSIZE)
     ax.legend(fontsize=LEGEND_FONTSIZE)
     ax.grid(alpha=0.3)
@@ -83,6 +92,8 @@ def plot_global_auc(metrics_df: pd.DataFrame, output_dir: str):
 
 def plot_hairpin_auc(metrics_df: pd.DataFrame, output_dir: str):
     """Plot Hairpin Contact AUC across blocks."""
+    # Same aggregation/smoothing/fill pattern as plot_global_auc() above, restricted
+    # to the hairpin_auc metric instead of global_auc.
     fig, ax = plt.subplots(figsize=FIGSIZE)
     
     agg = metrics_df.groupby('block_idx')['hairpin_auc'].mean().reset_index()
@@ -119,7 +130,7 @@ def plot_hairpin_auc(metrics_df: pd.DataFrame, output_dir: str):
 def plot_contact_map(sequence: str, name: str, hairpin_start: int, hairpin_end: int,
                      model, tokenizer, device, output_dir: str):
     """Generate and plot bias + contacts overlay for a sequence."""
-    import types
+    import types  # local import: only needed inside this function
     
     print(f"  Generating bias + contacts for {name}...")
     
@@ -127,6 +138,9 @@ def plot_contact_map(sequence: str, name: str, hairpin_start: int, hairpin_end: 
     VIZ_BLOCK = 30
     
     # Collect bias using modified forward
+    # Same monkey-patch-the-trunk-forward technique used throughout this codebase:
+    # temporarily replace model.trunk.forward with a version that intercepts
+    # block.pair_to_sequence's output (the bias) at VIZ_BLOCK, then restore it.
     collected_data = {'biases': {}}
     original_trunk_forward = model.trunk.forward
     
@@ -146,7 +160,7 @@ def plot_contact_map(sequence: str, name: str, hairpin_start: int, hairpin_end: 
             z = z + self.pairwise_positional_embedding(residx, mask=mask)
             for block_idx, block in enumerate(self.blocks):
                 if block_idx == VIZ_BLOCK:
-                    bias = block.pair_to_sequence(z)
+                    bias = block.pair_to_sequence(z)  # [1, L, L, num_heads]
                     collected_data['biases'][block_idx] = bias.detach().cpu()
                 s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
             return s, z
@@ -156,6 +170,8 @@ def plot_contact_map(sequence: str, name: str, hairpin_start: int, hairpin_end: 
         recycle_z = torch.zeros_like(s_z)
         recycle_bins = torch.zeros(*s_z.shape[:-1], device=device, dtype=torch.int64)
 
+        # Standard ESMFold/AlphaFold recycling loop (num_recycles=0 below -> a single,
+        # non-recycled pass through trunk_iter).
         for recycle_idx in range(no_recycles):
             with ContextManagers([] if recycle_idx == no_recycles - 1 else [torch.no_grad()]):
                 recycle_s = self.recycle_s_norm(recycle_s.detach()).to(device)
@@ -167,6 +183,8 @@ def plot_contact_map(sequence: str, name: str, hairpin_start: int, hairpin_end: 
                     true_aa, mask.float(),
                 )
                 recycle_s, recycle_z = s_s, s_z
+                # Discretize predicted CA-CA distances into bins spanning 3.375-21.375 Å
+                # for the next recycle's distance-embedding input.
                 recycle_bins = EsmFoldingTrunk.distogram(
                     structure["positions"][-1][:, :, :3], 3.375, 21.375, self.recycle_bins,
                 )
@@ -180,17 +198,20 @@ def plot_contact_map(sequence: str, name: str, hairpin_start: int, hairpin_end: 
         inputs = tokenizer(sequence, return_tensors='pt', add_special_tokens=False).to(device)
         outputs = model(**inputs, num_recycles=0)
     
+    # NOTE: possible bug -- no try/finally around the patched forward call above; if
+    # model(**inputs, ...) raises, model.trunk.forward is never restored and stays
+    # monkey-patched for the lifetime of this model object.
     model.trunk.forward = original_trunk_forward
     
     # Get CA positions and compute distances
     ca_positions = outputs.positions[-1, 0, :, 1, :]  # CA is atom index 1
     diff = ca_positions.unsqueeze(0) - ca_positions.unsqueeze(1)
     distances = torch.sqrt((diff ** 2).sum(-1)).cpu().numpy()
-    contacts = (distances < CONTACT_THRESHOLD).astype(float)
+    contacts = (distances < CONTACT_THRESHOLD).astype(float)  # binary contact map at the configured Å cutoff
     
     # Get bias
     bias = collected_data['biases'][VIZ_BLOCK]
-    bias_avg = bias[0].mean(dim=-1).cpu().numpy()
+    bias_avg = bias[0].mean(dim=-1).cpu().numpy()  # average over heads -> [L, L]
     
     # Create single plot: Global Bias + Contacts overlay
     fig, ax = plt.subplots(figsize=FIGSIZE)
@@ -210,6 +231,8 @@ def plot_contact_map(sequence: str, name: str, hairpin_start: int, hairpin_end: 
     cbar.ax.tick_params(labelsize=TICK_FONTSIZE - 2)
     
     # Legend for contacts
+    # ax.contour() doesn't automatically produce a legend entry, so a Line2D proxy
+    # artist (never actually drawn) is created purely to supply a legend label/color.
     from matplotlib.lines import Line2D
     legend_elements = [Line2D([0], [0], color='lime', linewidth=2, label=f'Contacts (<{CONTACT_THRESHOLD}Å)')]
     ax.legend(handles=legend_elements, loc='upper right', fontsize=LEGEND_FONTSIZE - 4)
@@ -228,14 +251,8 @@ def plot_contact_map(sequence: str, name: str, hairpin_start: int, hairpin_end: 
 def generate_contact_maps(seq_info_df: pd.DataFrame, output_dir: str, n_maps: int):
     """Generate contact maps for first N sequences."""
     print(f"\n--- Generating contact maps for {n_maps} sequences ---")
-    print("Loading ESMFold model...")
-    
-    from transformers import EsmForProteinFolding, AutoTokenizer
-    
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
-    print(f"Model loaded on {device}")
+    model, tokenizer = load_esmfold(device)
     
     for idx, row in seq_info_df.head(n_maps).iterrows():
         plot_contact_map(
@@ -249,6 +266,8 @@ def generate_contact_maps(seq_info_df: pd.DataFrame, output_dir: str, n_maps: in
             output_dir=output_dir,
         )
     
+    # This function loads its own model instance (separate from any model used
+    # elsewhere), so explicitly free it and release cached GPU memory once done.
     del model
     torch.cuda.empty_cache()
 
@@ -260,11 +279,14 @@ def generate_all_plots(metrics_df: pd.DataFrame, output_dir: str,
     plot_global_auc(metrics_df, output_dir)
     plot_hairpin_auc(metrics_df, output_dir)
     
+    # Contact map generation requires a loaded model (re-running forward passes),
+    # so it's skipped entirely if no sequence info was provided/loaded.
     if seq_info_df is not None and len(seq_info_df) > 0:
         generate_contact_maps(seq_info_df, output_dir, n_contact_maps)
 
 
 def main():
+    """Entry point: load saved bias-analysis metrics (and optionally sequence info) and generate all plots."""
     parser = argparse.ArgumentParser(description="Plot pair-to-sequence bias analysis results")
     parser.add_argument("--metrics", type=str, default="better_bias_analysis/metrics.parquet", help="Path to metrics parquet")
     parser.add_argument("--seq_info", type=str, default="better_bias_analysis/sequence_info.parquet", help="Path to sequence info parquet")
