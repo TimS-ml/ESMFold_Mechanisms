@@ -343,7 +343,11 @@ def compute_cb_distances(positions: torch.Tensor) -> torch.Tensor:
     Compute Cβ-Cβ distance matrix.
     Falls back to CA for glycine or missing Cβ.
     """
-    CB_IDX, CA_IDX = 3, 1
+    # atom14 ordering is N=0, CA=1, C=2, O=3, CB=4, so CB is index 4. (Was 3, which is the
+    # backbone carbonyl O -- a bug: it computed O-O distances, not CB-CB. Note the sibling
+    # compute_backbone_no_distances() below correctly uses O at index 3. With CB_IDX=4 the
+    # `< 0.1` fallback below now correctly covers Gly, whose CB slot is zero-filled.)
+    CB_IDX, CA_IDX = 4, 1
     L = positions.shape[0]
     
     cb_coords = []
