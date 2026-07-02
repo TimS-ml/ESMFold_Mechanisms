@@ -14,6 +14,7 @@ Key functions:
 """
 
 import pandas as pd
+import numpy as np  # used by get_CB_or_virtual / compute_handedness_from_structure below
 import os
 import requests
 import torch
@@ -76,13 +77,10 @@ def run_dssp_from_outputs(outputs, model, batch_idx=0):
             dssp = DSSP(model0, pdb_path, dssp="mkdssp")
     except Exception as e:
         warnings.warn(f"DSSP failed: {e}", RuntimeWarning)
-        # NOTE: possible bug -- this returns a 3-tuple (None, None, None) on
-        # failure, but the success path below returns a single `df` value.
-        # detect_hairpins() calls this as `dssp_df = run_dssp_from_outputs(...)`
-        # then checks `if dssp_df is None`, which will NOT catch this failure
-        # (a 3-tuple is not None), so it would proceed to do `dssp_df["Chain"]`
-        # on a tuple and raise TypeError instead of hitting the intended path.
-        return None, None, None
+        # Return a bare None (not a tuple) so detect_hairpins()'s `if dssp_df is None`
+        # check below actually catches the failure. The success path returns a single
+        # DataFrame, so the failure sentinel must match that arity.
+        return None
 
     rows = []
     for key in dssp.keys():
@@ -170,9 +168,8 @@ def detect_hairpins(outputs, model, min_len=2, max_loop=5):
     """
 
     dssp_df = run_dssp_from_outputs(outputs, model)
-    # NOTE: possible bug -- on DSSP failure, run_dssp_from_outputs() returns
-    # the 3-tuple (None, None, None), not a bare None, so this check never
-    # actually catches the failure case (see the NOTE inside that function).
+    # run_dssp_from_outputs() returns a bare None on DSSP failure, so this check
+    # catches it and returns gracefully instead of crashing on the None below.
     if dssp_df is None:
         print("❌ DSSP failed.")
         return None, None
@@ -494,10 +491,9 @@ def visualize_hairpin_handedness_from_cif_or_pdb(
     # py3Dmol's addModel(..., "pdb") below only accepts PDB-format text, so
     # the (possibly CIF-parsed) Structure object is re-serialized to PDB and
     # read back in, regardless of whether the original input was CIF or PDB.
-    # NOTE: possible bug -- `PDBIO` is never imported in this file (only
-    # `PDB` and `DSSP` are imported from Bio.PDB at the top); this raises
-    # NameError: name 'PDBIO' is not defined. Likely meant `PDB.PDBIO()`.
-    io = PDBIO()
+    # PDBIO is accessed via the `PDB` module namespace imported at the top
+    # (`from Bio import PDB`); `PDBIO` on its own is not imported into scope.
+    io = PDB.PDBIO()
     io.set_structure(structure)
     tmp_pdb = tempfile.NamedTemporaryFile(suffix=".pdb", delete=False).name
     io.save(tmp_pdb)

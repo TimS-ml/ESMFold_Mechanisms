@@ -309,9 +309,11 @@ def compute_cb_distances(positions: torch.Tensor) -> torch.Tensor:
     # positions: [L, 14, 3] atom14-format coordinates (order: N, CA, C, O, CB, ...; see
     # openfold_utils.residue_constants.restype_name_to_atom14_names).
     L = positions.shape[0]
-    # NOTE: possible bug -- atom14 index 3 is the backbone carbonyl O, not CB (CB is index 4).
-    # This function may actually be computing O-O distances instead of CB-CB distances.
-    CB_IDX, CA_IDX = 3, 1
+    # atom14 ordering is N=0, CA=1, C=2, O=3, CB=4 (openfold_utils residue_constants),
+    # so CB is index 4. (Was 3, which is the backbone carbonyl O -- a bug: it made this
+    # compute O-O distances, not CB-CB. The glycine fallback below only makes sense when
+    # CB_IDX points at CB, since Gly's CB slot is zero-filled while O is always present.)
+    CB_IDX, CA_IDX = 4, 1
     
     cb_coords = []
     for i in range(L):

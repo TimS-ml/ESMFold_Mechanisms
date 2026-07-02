@@ -203,11 +203,9 @@ def plot_dist_change_by_window_size(
     for window_size in window_sizes:
         ws_data = interventions[interventions['window_size'] == window_size]
         
-        # NOTE: possible bug -- figsize width of 147 (inches) looks like a typo; every
-        # sibling plot in this file uses a width around 12-14 (e.g.
-        # plot_hbond_change_by_window_size's figsize=(12, 6) below). This produces an
-        # enormous, likely unusable image.
-        fig, ax = plt.subplots(figsize=(147, 6))
+        # (was figsize=(147, 6) -- a typo producing an enormous unusable image;
+        # matched to the ~12-14 width used by the sibling plots in this file.)
+        fig, ax = plt.subplots(figsize=(14, 6))
         
         # Nested loop encodes magnitude via color and charge polarity via linestyle/marker,
         # so both dimensions are visible simultaneously in one legend.

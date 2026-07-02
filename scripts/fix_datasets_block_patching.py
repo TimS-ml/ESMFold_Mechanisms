@@ -49,7 +49,7 @@ print(f"\nTotal rows: {len(single_block_patching_successes)}")
 print(f"Sequence block 0 rows: {len(sequence_block0)}")
 print(f"Pairwise block 30 rows: {len(pairwise_block30)}")
 
-# NOTE: possible bug -- missing index=False (inconsistent with the other fix_datasets_*.py
-# scripts in this directory), so the DataFrame's RangeIndex will be written as an extra
-# unnamed leading column in the CSV.
-single_block_patching_successes.to_csv("data/single_block_patching_successes.csv")
+# index=False keeps the output schema consistent with the other fix_datasets_*.py scripts
+# (otherwise the RangeIndex is written as an extra unnamed leading column that downstream
+# pd.read_csv consumers of single_block_patching_successes.csv would then pick up).
+single_block_patching_successes.to_csv("data/single_block_patching_successes.csv", index=False)

@@ -1146,12 +1146,11 @@ def plot_all_windows_comparison(
     n_rows = (n_windows + n_cols - 1) // n_cols  # ceiling division: n_rows * n_cols >= n_windows
     
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(6*n_cols, 5*n_rows), sharex=True, sharey=True)
-    # NOTE: possible bug -- when n_windows == 1, n_rows == 1 and n_cols == 3, so plt.subplots
-    # still returns a 1D array of 3 Axes (squeeze only collapses dims that are exactly 1x1);
-    # the `else [axes]` branch then wraps that whole 3-Axes array into a length-1 list, so
-    # axes[0] would be an ndarray (not a single Axes) and the `ax.plot(...)` calls below would
-    # raise AttributeError. Only reachable if window_start_min == window_start_max (n_windows == 1).
-    axes = axes.flatten() if n_windows > 1 else [axes]
+    # n_cols is always 3, so plt.subplots always returns an ndarray of Axes (never a bare
+    # Axes, which only happens for a 1x1 grid). np.atleast_1d(...).flatten() handles every
+    # n_rows/n_windows case uniformly, including n_windows == 1 (which used to wrap the
+    # 3-Axes array in a length-1 list and crash with AttributeError in the loop below).
+    axes = np.atleast_1d(axes).flatten()
     
     for i, window_start in enumerate(window_starts):
         ax = axes[i]

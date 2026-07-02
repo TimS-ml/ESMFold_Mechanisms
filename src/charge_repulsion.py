@@ -341,12 +341,11 @@ def compute_cb_distances(positions: torch.Tensor) -> torch.Tensor:
     """Compute Cβ-Cβ distances from atom positions."""
     # positions: [L, 14, 3] atom14-format coordinates for one chain (N=0, CA=1, C=2, O=3, CB=4, ...)
     L = positions.shape[0]
-    # NOTE: possible bug -- atom14 ordering (per openfold_utils residue_constants) is
-    # N=0, CA=1, C=2, O=3, CB=4, so index 3 is the backbone O atom, not CB. CB_IDX should
-    # likely be 4. As written, this computes O···O pseudo-distances (mislabeled as Cβ-Cβ),
-    # and the `< 0.1` fallback below almost never triggers for O (which is essentially never
-    # at the origin), so it doesn't correctly cover Gly (which truly lacks a CB atom).
-    CB_IDX, CA_IDX = 3, 1
+    # atom14 ordering (per openfold_utils residue_constants) is N=0, CA=1, C=2, O=3, CB=4,
+    # so CB is index 4. (Was 3, which is the backbone O -- a bug: it made this compute O-O
+    # pseudo-distances mislabeled as Cβ-Cβ. With CB_IDX=4 the `< 0.1` fallback below now
+    # correctly covers Gly, whose CB slot is zero-filled while O is essentially always present.)
+    CB_IDX, CA_IDX = 4, 1
     
     cb_coords = []
     for i in range(L):
