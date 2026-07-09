@@ -56,9 +56,10 @@ from src.utils.representation_utils import (  # noqa: E402
     IPAHooks,
 )
 
-# Villin headpiece subdomain (HP36): a classic small fast-folder, 3 helices.
-DEFAULT_SEQUENCE = "MLSDEDFKAVFGMTRSAFANLPLWKQQNLKKEKGLF"
-DEFAULT_NAME = "villin_hp36"
+# GB1 beta-hairpin peptide: the ESM_Internal steering-demo input.
+# Strand1 EWTYD, turn DATK, Strand2 TFTVT (16 residues).
+DEFAULT_SEQUENCE = "GEWTYDDATKTFTVTE"
+DEFAULT_NAME = "gb1_hairpin"
 
 
 # ---------------------------------------------------------------------------
