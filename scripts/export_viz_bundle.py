@@ -17,6 +17,7 @@ The full activation tensors are far too big to ship to a browser
   - trunk.s_res_norm   : per (block, residue) L2 norm of s       [48][L]
   - trunk.s_slab       : downsampled s features for a few blocks [nb][L][ds]
   - trunk.z_norm       : per block, L x L norm over 128 channels [48][L][L]
+  - trunk.z_slab       : downsampled z channels as LxL maps      [nb][L][L][dz]
   - trunk.pair_bias    : z->s attention bias (mean over heads)   [nb][L][L]
   - ipa.block_res_norm : per structure-module block, per residue [8][L]
   - structure          : pdb string, plddt, pae, ptm, CA coords
@@ -121,7 +122,7 @@ def collect(model, tokenizer, device, sequence, num_recycles):
 # turn collected tensors into the compact JSON bundle
 # ---------------------------------------------------------------------------
 def build_bundle(name, sequence, outputs, collector, model, num_recycles,
-                 slab_blocks, slab_ds, bias_blocks):
+                 slab_blocks, slab_ds, bias_blocks, z_slab_ds):
     L = len(sequence)
 
     # ---- ESM-2 backbone: per (layer, residue) activation magnitude ----------
@@ -161,6 +162,20 @@ def build_bundle(name, sequence, outputs, collector, model, num_recycles,
     for i in z_ids:
         z = _f(collector.z_blocks[i])[0]  # [L, L, 128]
         z_norm.append(rnd(z.norm(dim=-1).numpy(), 3))
+
+    # downsampled pair-tensor channel embedding (the pair analog of s_slab):
+    # a few of z's 128 channels kept as full L x L maps, so the front-end can
+    # show that different channels encode different geometric/contact patterns.
+    z_slab = None
+    if slab_blocks:
+        want = [b for b in slab_blocks if b in collector.z_blocks]
+        data = []
+        for b in want:
+            z = _f(collector.z_blocks[b])[0]  # [L, L, 128]
+            stride = max(1, z.shape[-1] // z_slab_ds)
+            ds = z[:, :, ::stride][:, :, :z_slab_ds]  # [L, L, ds]
+            data.append(rnd(ds.numpy(), 3))
+        z_slab = {"blocks": want, "feat": z_slab_ds, "data": data}
 
     pair_bias = None
     if bias_blocks and collector.pair2seq_biases:
@@ -232,6 +247,7 @@ def build_bundle(name, sequence, outputs, collector, model, num_recycles,
             "s_res_norm": s_res_norm,
             "s_slab": s_slab,
             "z_norm": z_norm,
+            "z_slab": z_slab,
             "pair_bias": pair_bias,
         },
         "ipa": {"block_res_norm": ipa_res_norm},
@@ -280,6 +296,8 @@ def main():
                     help="trunk blocks to export a downsampled s feature slab for")
     ap.add_argument("--slab-ds", type=int, default=64,
                     help="number of downsampled s features in the slab")
+    ap.add_argument("--z-slab-ds", type=int, default=12,
+                    help="number of z (pair) channels kept as full LxL maps")
     ap.add_argument("--bias-blocks", type=int, nargs="*",
                     default=[0, 8, 16, 24, 32, 40, 47],
                     help="trunk blocks to export the z->s attention bias for")
@@ -304,7 +322,7 @@ def main():
     print("[export] building bundle ...")
     bundle = build_bundle(
         args.name, seq, outputs, collector, model, args.num_recycles,
-        args.slab_blocks, args.slab_ds, args.bias_blocks,
+        args.slab_blocks, args.slab_ds, args.bias_blocks, args.z_slab_ds,
     )
 
     out_dir = Path(args.out) if args.out else (
